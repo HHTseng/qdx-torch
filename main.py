@@ -90,6 +90,13 @@ def mean_or_none(values):
     return float(np.mean(values))
 
 
+def to_host_np(value):
+    """Convert a (possibly CUDA/MPS) torch tensor to a NumPy array."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
 def completed_episode_values(info, name):
     if info is None or name not in info:
         return None
@@ -109,7 +116,7 @@ def completed_episode_mean(info, name):
 
 
 def rollout_success_stats(traj_batch, max_steps):
-    done = np.asarray(traj_batch.done).astype(bool).reshape(-1)
+    done = to_host_np(traj_batch.done).astype(bool).reshape(-1)
     episode_count = int(np.sum(done))
     episode_lengths = completed_episode_values(
         traj_batch.info, "returned_episode_lengths"
@@ -354,8 +361,8 @@ def summarize_loss_metrics(loss_metrics):
 
 def summarize_task_rollout(task, traj_batch, max_steps):
     info = traj_batch.info
-    reward_mean = float(np.mean(np.asarray(traj_batch.reward)))
-    done_rate = float(np.mean(np.asarray(traj_batch.done, dtype=np.float32)))
+    reward_mean = float(np.mean(to_host_np(traj_batch.reward)))
+    done_rate = float(np.mean(to_host_np(traj_batch.done).astype(np.float32)))
     stats = rollout_success_stats(traj_batch, max_steps=max_steps)
     return {
         "graph": task["graph"],
