@@ -1,24 +1,24 @@
 from envs.code_discovery_env import CodeDiscoveryCSS
 from simulators.tableau_simulator_css import TableauSimulatorCSS
 from simulators.clifford_gates_css import CliffordGatesCSS
-import os 
-import jax
+import os
+import torch_random
+import torch_nn
 from make_train import make_train, ActorCritic
 from utils_css import UtilsCSS
-import time 
+import time
 import json
 import pickle
 import numpy as np
-import jax.numpy as jnp
-import flax.linen as nn
+import torch
 
 class CodeFinderCSS:
-    
+
     def __init__(self, config):
-        self.config = config   
+        self.config = config
         # Initialize the RL environment
         self.make_environment()
-        
+
     def make_graph(self):
 
         if self.config["GRAPH"] == "All-to-All":
@@ -41,64 +41,82 @@ class CodeFinderCSS:
             for ii in range(self.config["N"]-2):
                 graph.append((ii,ii+2))
                 graph.append((ii+2,ii))
-                
+
         self.graph = graph
-        
-        return 
-        
+
+        return
+
     def make_environment(self):
-        
+
         self.make_graph()
-        
+
         gates = CliffordGatesCSS(self.config["N"])
-        
+
         gate_set = []
         for g in self.config["WHICH_GATES"]:
             gate_set.append(eval("gates.%s" % g))
-            
+
         ## For some reason this throws out the error: "'gates' is not defined"
         #gate_set = [eval("gates.%s" % g) for g in self.config["WHICH_GATES"]]
-        
 
-        self.env = CodeDiscoveryCSS(self.config["N"], 
-                                    self.config["K"], 
+
+        self.env = CodeDiscoveryCSS(self.config["N"],
+                                    self.config["K"],
                                     self.config["D"],
                                     self.config["INIT_H"],
-                                    gate_set, 
-                                    graph = self.graph, 
-                                    max_steps = self.config["MAX_STEPS"], 
-                                    lbda = self.config["LAMBDA"], 
-                                    pI = self.config["P_I"], 
+                                    gate_set,
+                                    graph = self.graph,
+                                    max_steps = self.config["MAX_STEPS"],
+                                    lbda = self.config["LAMBDA"],
+                                    pI = self.config["P_I"],
                                     softness = self.config["SOFTNESS"],
                                     bell = self.config["BELL"])
 
         return
-    
+
     def train(self, params):
         """ Training the agent. """
-        
+
         #### Training
-        rng = jax.random.PRNGKey(self.config["SEED"])
-        rngs = jax.random.split(rng, self.config['NUM_AGENTS'])
-        train_vjit = jax.jit(jax.vmap(make_train(self.config, self.env, network_params_init = params)))
+        rng = torch_random.PRNGKey(self.config["SEED"])
+        rngs = torch_random.split(rng, self.config['NUM_AGENTS'])
+        train_fn = make_train(self.config, self.env, network_params_init = params)
         t0 = time.perf_counter()
         print("==== Training started")
-        outs = jax.block_until_ready(train_vjit(rngs, network_params_init = params))
+        # Sequential equivalent of jax.vmap over the agents; if params are
+        # provided they carry a leading agent axis, exactly like under vmap.
+        outs_list = []
+        for i in range(self.config['NUM_AGENTS']):
+            params_i = None
+            if params is not None:
+                params_i = torch_nn._tree_map(lambda leaf: leaf[i], params)
+            outs_list.append(train_fn(rngs[i], network_params_init=params_i))
         self.config["TIME"] = time.perf_counter() - t0
         print("==== Training finished, time elapsed: %.5f s" % (self.config["TIME"]))
-        
+
+        # Stack results along a leading agent axis, like jax.vmap would
+        outs = {
+            "params": torch_nn._tree_map(
+                lambda *leaves: torch.stack([l.detach() for l in leaves]),
+                *[o["params"] for o in outs_list]
+            ),
+        }
         if self.config["COMPUTE_METRICS"]:
+            outs["metrics"] = {
+                k: np.stack([o["metrics"][k] for o in outs_list])
+                for k in outs_list[0]["metrics"].keys()
+            }
             metrics = {'returned_episode_returns': np.array(outs["metrics"]['returned_episode_returns']),
                        'returned_episode_lengths': np.array(outs["metrics"]['returned_episode_lengths'])}
-            
+
         else:
             metrics = {'returned_episode_returns': np.array([0]),
                        'returned_episode_lengths': np.array([0])}
-            
+
         self.params = outs['params']
-        
+
         return self.params, metrics
-    
+
     def flatten_list(self, nested_list):
 
         flat_list = []
@@ -108,7 +126,7 @@ class CodeFinderCSS:
             else:
                 flat_list.append(item)  # If it's a string, just add it to the flat list
         return flat_list
-    
+
     def evaluate(self):
 
         data = []
@@ -120,7 +138,7 @@ class CodeFinderCSS:
             params_eval['params'] = {}
 
             for key in self.params['params'].keys():
-                params_eval['params'][key] = {} 
+                params_eval['params'][key] = {}
 
                 for key2 in self.params['params'][key].keys():
                     params_eval['params'][key][key2]= self.params['params'][key][key2][index]
@@ -128,7 +146,7 @@ class CodeFinderCSS:
             eval_env = self.env
             env_params = None
             # Reset
-            reset_rng = jax.random.PRNGKey(self.config["SEED"]+1)
+            reset_rng = torch_random.PRNGKey(self.config["SEED"]+1)
             obsv, env_state = eval_env.reset(reset_rng, None)
             # Prepare network
             network = ActorCritic(eval_env.action_space().n, activation=self.config["ACTIVATION"], hidden_dim = self.config["HIDDEN_DIM"])
@@ -137,13 +155,14 @@ class CodeFinderCSS:
 
             while not done:
                 # Sample action
-                pi, value = network.apply(params_eval, obsv)
-                action = jnp.argmax(nn.softmax(pi.logits))
+                with torch.no_grad():
+                    pi, value = network.apply(params_eval, obsv.flatten())
+                    action = int(torch.argmax(torch_nn.softmax(pi.logits)))
                 actions.append(action)
                 # print('a:', action)
 
                 # STEP ENV
-                rng_step = jax.random.PRNGKey(self.config["SEED"]+2)
+                rng_step = torch_random.PRNGKey(self.config["SEED"]+2)
                 obsv, env_state, reward, done, info = eval_env.step(
                     rng_step, env_state, action, env_params
                 )
@@ -177,13 +196,13 @@ class CodeFinderCSS:
                 data.append({'n': self.config["N"], 'k': self.config["K"], 'd': code_distance, 'G_X': H_X, 'G_Z': H_Z, 'gates': ['.h('+str(i)+')' for i in self.config["INIT_H"]] + gates})
 
         return data
-    
+
     def compute_distance(self, gates):
-        
+
         eval_d = self.config["D"]
 
         tableau = TableauSimulatorCSS(self.config["N"], self.config["K"], init_H=self.config["INIT_H"], bell=self.config["BELL"])
-        
+
         for g in gates:
             eval("tableau%s" % g)
 

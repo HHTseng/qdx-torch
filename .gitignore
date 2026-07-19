@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 *.DS_Store
 
+# Generated demo artifacts (recreated by demo1.py / demo2.py)
+demo_outputs/
+
 # C extensions
 *.so
 

@@ -1,9 +1,8 @@
-from gymnax.environments import environment, spaces
-import jax
-import jax.numpy as jnp
+from qdx.torch_env_base import Environment, spaces
+from qdx import torch_random
 import numpy as np
-from flax import struct
-import chex
+import torch
+from dataclasses import dataclass, field
 from inspect import signature
 from typing import Tuple, Optional
 import itertools
@@ -13,10 +12,9 @@ from more_itertools import distinct_permutations
 from itertools import combinations
 import random
 import scipy.special as ss
-from jax import lax
 
 
-@struct.dataclass
+@dataclass(frozen=True)
 class EnvState:
     """
     This class will contain the state of the environment:
@@ -26,59 +24,59 @@ class EnvState:
     cZ: bias parameter
     p_mu: probabilities of all errors considered
     """
-    tableau: jax.Array
+    tableau: torch.Tensor
     time: int
     cZ: float
-    p_mu: jax.Array
+    p_mu: torch.Tensor
 
-@struct.dataclass
+@dataclass(frozen=True)
 class NoiseParams:
     """
     This class contains the possible values for cZ, pI, pX.
 
     It's used in reset_env() to update p_mu
     """
-    # This weird way of defining the arrays is a workaround to https://github.com/jax-ml/jax/issues/14295
-    cZs: int = struct.field(default_factory=lambda: jnp.array(np.arange(0.5,2.1,0.1)))
-    pIs: int = struct.field(default_factory=lambda: jnp.array([0.6, 0.75, 0.9, 0.95, 0.99, 0.999]))
-    pXs: int = struct.field(default_factory=lambda: jnp.array([[0.0688262, 0.0855959, 0.100139, 0.112763,
+    # float32 arrays to match the JAX (x64-disabled) originals
+    cZs: np.ndarray = field(default_factory=lambda: np.arange(0.5,2.1,0.1).astype(np.float32))
+    pIs: np.ndarray = field(default_factory=lambda: np.array([0.6, 0.75, 0.9, 0.95, 0.99, 0.999], dtype=np.float32))
+    pXs: np.ndarray = field(default_factory=lambda: np.array([[0.0688262, 0.0855959, 0.100139, 0.112763,
                             0.123748, 0.133333, 0.141718, 0.149065,
                             0.15551, 0.16117, 0.16614, 0.170505,
                             0.174336, 0.177696, 0.18064, 0.183216],
-            
+
                    [0.0334936, 0.0460898, 0.0573777, 0.0672837,
-                            0.0758924, 0.0833333, 0.0897416, 0.095244, 
+                            0.0758924, 0.0833333, 0.0897416, 0.095244,
                             0.0999552, 0.103977, 0.107401, 0.110306,
                             0.112764, 0.114835, 0.116576, 0.118034],
-            
+
                    [0.0072949, 0.0130273, 0.0189089, 0.0243794,
                            0.0292073, 0.0333333, 0.0367819, 0.0396151,
                            0.0419095, 0.0437445, 0.0451958, 0.0463324,
                            0.0472145, 0.0478939, 0.0484136, 0.0488088],
-            
+
                    [0.00209801, 0.00476888, 0.00798924, 0.0112246,
                            0.0141615, 0.0166667, 0.0187142, 0.0203349,
                            0.0215852, 0.0225293, 0.0232297, 0.0237417,
                            0.0241113, 0.0243756, 0.024563, 0.0246951],
-            
+
                    [0.0000961894, 0.000403434, 0.00100751, 0.00180597,
-                           0.00262342, 0.00333333, 0.00388495, 0.00428087, 
-                           0.00454894, 0.00472277, 0.00483205, 0.00489927, 
-                           0.00493998, 0.00496439, 0.00497894, 0.00498756]]))
+                           0.00262342, 0.00333333, 0.00388495, 0.00428087,
+                           0.00454894, 0.00472277, 0.00483205, 0.00489927,
+                           0.00493998, 0.00496439, 0.00497894, 0.00498756]], dtype=np.float32))
 
 # UNUSED
-@struct.dataclass
+@dataclass(frozen=True)
 class EnvParams:
     n: int = 14
     k: int = 1
     d: int = 5
     max_steps_in_episode: int = 30
 
-    
-class MetaCodeDiscovery(environment.Environment):
+
+class MetaCodeDiscovery(Environment):
     """
     Environment for the noise-aware discovery of QEC codes and encodings for different error models simultaneously.
-    
+
     Args:
         n_qubits_physical (int): Number of physical qubits available
         n_qubits_logical (int): Number of logical qubits
@@ -111,7 +109,7 @@ class MetaCodeDiscovery(environment.Environment):
             softness = 1,
                 ):
         super().__init__()
-        
+
         self.n_qubits_physical = n_qubits_physical
         self.n_qubits_logical = n_qubits_logical
         self.gates = gates
@@ -124,11 +122,11 @@ class MetaCodeDiscovery(environment.Environment):
         self.pX = pX
         self.pI = pI # Probability of no error
         noise_params = NoiseParams()
-        
-        
-        self.pI_id = jnp.where(noise_params.pIs == self.pI)[0][0]
-        
-        
+
+
+        self.pI_id = np.where(noise_params.pIs == np.float32(self.pI))[0][0]
+
+
         self.graph = graph
         if self.graph is None:
             self.graph = []
@@ -138,29 +136,31 @@ class MetaCodeDiscovery(environment.Environment):
                     self.graph.append((ii,jj))
                     self.graph.append((jj,ii))
 
-        
+
         self.obs_shape = (2 * n_qubits_physical * (n_qubits_physical - n_qubits_logical) + 1, )
 
         # Initialize action tensor
         self.actions = self.action_matrix()
-        
+
         # Symplectic metric Omega
-        self.Omega = jnp.kron(jnp.array([[0,1],[1,0]], dtype=jnp.int8), jnp.eye(n_qubits_physical, dtype=jnp.uint8))
+        self.Omega = torch.from_numpy(
+            np.kron(np.array([[0,1],[1,0]], dtype=np.uint8), np.eye(n_qubits_physical, dtype=np.uint8)))
 
         # Initialize error operators
         self.E_mu = self.error_operators()
 
-        # Separate X,Y,Z part of errors. Useful to compute p_mu
-        self.H_X = self.E_mu[:,:n_qubits_physical]
-        self.H_Z = self.E_mu[:,n_qubits_physical:]
+        # Separate X,Y,Z part of errors (NumPy uint8, used to compute p_mu in float32)
+        E_mu_np = self.E_mu.numpy()
+        self.H_X = E_mu_np[:,:n_qubits_physical]
+        self.H_Z = E_mu_np[:,n_qubits_physical:]
         self.H_Y = self.H_X * self.H_Z
-        
+
         # Initialize stabilizer group structure
-        self.generate_S_structure(softness) # This generates self.S_struct      
-        
+        self.generate_S_structure(softness) # This generates self.S_struct
+
         # Initialize num_KL
         self.num_KL = len(self.E_mu)
-        
+
 
     @property
     def default_params(self) -> EnvParams:
@@ -169,9 +169,9 @@ class MetaCodeDiscovery(environment.Environment):
 
     def generate_S_structure(self, softness):
         # Generate the structure of the stabilizer group (S) based on the softness parameter.
-    
+
         num = self.n_qubits_physical - self.n_qubits_logical
-        
+
         # Calculate the number of stabilizer elements
         soft_elements = int(sum([ss.binom(num,i) for i in range(1,softness+1)]))
 
@@ -193,23 +193,23 @@ class MetaCodeDiscovery(environment.Environment):
 
             # Update the start_idx
             start_idx += i+1
-            
+
         # Ensure there are no rows with all zeroes in the S structure
         assert np.prod(np.any(S_struct, axis=1)), "There is a row with all zeroes"
-        
-        # Convert the S structure to a JAX array for efficient computation
-        self.S_struct = jnp.array(S_struct, dtype=jnp.uint8)
+
+        # Convert the S structure to a uint8 torch tensor for efficient computation
+        self.S_struct = torch.from_numpy(S_struct.astype(np.uint8))
 
         return
-    
+
     def stabilizer_elements(self, tableau):
         # Generate the S matrix by multiplying the S structure with the tableau
         return (self.S_struct @ tableau) % 2
 
-    
+
     def action_matrix(self,
-                      params: Optional[EnvParams] = EnvParams) -> chex.Array:
-        
+                      params: Optional[EnvParams] = EnvParams) -> torch.Tensor:
+
         action_matrix = []
         self.action_string = []
         self.action_string_stim = []
@@ -221,150 +221,160 @@ class MetaCodeDiscovery(environment.Environment):
                     action_matrix.append(gate(n_qubit))
                     self.action_string.append('%s-%d' % (gate.__name__, n_qubit))
                     self.action_string_stim.append('.%s(%d)' % (gate.__name__.lower(), n_qubit))
-                    
+
 
             ## Two qubit gates
             elif len(signature(gate).parameters) == 2:
                 for edge in self.graph:
-                    action_matrix.append(gate(edge[0], edge[1]))                    
+                    action_matrix.append(gate(edge[0], edge[1]))
                     self.action_string.append('%s-%d-%d' % (gate.__name__, edge[0], edge[1]))
                     self.action_string_stim.append('.%s(%d, %d)' % (gate.__name__.lower(), edge[0], edge[1]))
-            
-                    
-        return jnp.array(action_matrix, dtype=jnp.uint8)
-    
+
+
+        return torch.stack(action_matrix).to(torch.uint8)
+
     def get_observation(self, tableau, cZ):
         '''
         Extract the check matrix of stabilizer generators for the observation
         '''
         ## Only generators without sign
-        check_mat = tableau[self.n_qubits_physical + self.n_qubits_logical:].astype(jnp.float32)
-     
-        return jnp.concatenate((check_mat.flatten(), jnp.array([(cZ-0.5)/1.5])))
-    
-    def error_operators(self, params: Optional[EnvParams] = EnvParams) -> chex.Array:
-        
+        check_mat = tableau[self.n_qubits_physical + self.n_qubits_logical:].to(torch.float32)
+
+        return torch.cat((check_mat.flatten(),
+                          torch.tensor([float((np.float32(cZ)-np.float32(0.5))/np.float32(1.5))], dtype=torch.float32)))
+
+    def error_operators(self, params: Optional[EnvParams] = EnvParams) -> torch.Tensor:
+
         error_list = [1,2,3] # Corresponds to X,Y,Z
-        
+
         results = []
-        
+
         for weight in range(1, self.d):
             # Generate all combinations of errors with repetition based on the current weight
             prod = list(list(tup) for tup in itertools.combinations_with_replacement(error_list, weight))
-            
+
             # Pad the error list to match the number of physical qubits
             prod = [pr + [0] * (self.n_qubits_physical - weight) for pr in prod]
-            
+
             # Generate distinct permutations of each product to form the error structure
             result = list(list(distinct_permutations(pr, self.n_qubits_physical)) for pr in prod)
             results.append(list(itertools.chain(*result)))
-            
+
         error_structure = list(itertools.chain(*results))
-        
-        # Convert error structure to a JAX array for efficient computation
-        E_mu = jnp.array([jnp.array(stim.PauliString(p).to_numpy()).flatten() for p in error_structure], dtype=jnp.uint8)
-        
+
+        # Convert error structure to a torch tensor for efficient computation
+        E_mu = torch.from_numpy(
+            np.array([np.array(stim.PauliString(p).to_numpy()).flatten() for p in error_structure], dtype=np.uint8))
+
         return E_mu
 
-    
+
     def check_KL(self, state: EnvState, params: Optional[EnvParams] = EnvParams):
         # Check the Knill-Laflamme conditions for error correction. This is used to reward the agent
-        
+
         # Extract the stabilizer generators
         check_matrix = state.tableau[self.n_qubits_physical + self.n_qubits_logical:]
-        
+
         # Update the stabilizer group S
         S = self.stabilizer_elements(check_matrix)
-        
+
         # Determine if errors are in S by calculating the logical XOR between S and error operators, E_mu
-        inS = jax.vmap(jnp.logical_xor, in_axes=(None,0))(S, self.E_mu)
-        inS = jnp.prod(jnp.logical_not(inS), axis=-1)
-        
+        # (vectorized equivalent of jax.vmap(jnp.logical_xor, in_axes=(None, 0))(S, E_mu))
+        inS = torch.logical_xor(S[None, :, :], self.E_mu[:, None, :])
+        inS = torch.logical_not(inS).all(dim=-1).to(torch.int32)
+
         # Calculate the number of Knill-Laflamme conditions that are not satisfied. This is used for stopping criterion
-        self.num_KL = len(self.E_mu) - jnp.sum(jnp.any(((self.E_mu @ self.Omega) @ check_matrix.T)%2, axis=1), axis=0) - jnp.sum(inS)
-        
-        # Return the weighted KL sum rescaled by lbda
-        return self.lbda * ( jnp.sum(state.p_mu) - jnp.sum(state.p_mu * jnp.any(((self.E_mu @ self.Omega) @ check_matrix.T)%2, axis=1), axis=0) - jnp.dot(state.p_mu, jnp.sum(inS, axis=-1)) )
-    
-    
+        anticommutes = torch.any(((self.E_mu @ self.Omega) @ check_matrix.T)%2, dim=1)
+        self.num_KL = int(len(self.E_mu) - torch.sum(anticommutes, dim=0) - torch.sum(inS))
+
+        p_mu = torch.as_tensor(state.p_mu, dtype=torch.float32)
+        rew = ( torch.sum(p_mu) - torch.sum(p_mu * anticommutes, dim=0)
+                - torch.dot(p_mu, torch.sum(inS, dim=-1).to(torch.float32)) )
+        # Return the weighted KL sum rescaled by lbda (as a float32 scalar)
+        return np.float32(self.lbda) * np.float32(rew.item())
+
+
     def step_env(
-        self, key: chex.PRNGKey, state: EnvState, action: int, params: EnvParams
-    ) -> Tuple[chex.Array, EnvState, float, bool, dict]:
+        self, key, state: EnvState, action: int, params: EnvParams
+    ) -> Tuple[torch.Tensor, EnvState, float, bool, dict]:
         """Performs step transitions in the environment."""
-        
+
         prev_terminal = self.is_terminal(state, params)
-        
+
         # Update state
         state = EnvState( (state.tableau @ self.actions[action]) % 2, state.time + 1, state.cZ, state.p_mu)
-        
+
         # Update KLs
-        reward = -self.check_KL(state) 
+        reward = -self.check_KL(state)
 
         # Evaluate termination conditions
         done = self.is_terminal(state, params)
 
         return (
-            lax.stop_gradient(self.get_obs(state)),
-            lax.stop_gradient(state),
+            self.get_obs(state),
+            state,
             reward,
             done,
             {"discount": self.discount(state, params)},
         )
 
     def reset_env(
-        self, key: chex.PRNGKey, params: EnvParams, noise: Optional[NoiseParams] = NoiseParams()
-    ) -> Tuple[chex.Array, EnvState]:
+        self, key, params: EnvParams, noise: Optional[NoiseParams] = None
+    ) -> Tuple[torch.Tensor, EnvState]:
         """Performs resetting of environment."""
-        
+
+        if noise is None:
+            noise = NoiseParams()
+
         tableau = TableauSimulator(self.n_qubits_physical)
         init_state = tableau.current_tableau[0]
 
-            
+
         if self.random_cZ:
             # Choose a value of cZ using a uniform PDF
-            cZ_id = jax.random.choice(key, jnp.array(range(len(noise.cZs))))
-            
+            cZ_id = torch_random.choice(key, np.array(range(len(noise.cZs))))
+
             # Select the noise parameters accordingly
-            cZ = noise.cZs[cZ_id] 
-            # pI_id = jnp.where(noise.pIs == self.pI)[0][0]
+            cZ = noise.cZs[cZ_id]
+            # pI_id = np.where(noise.pIs == self.pI)[0][0]
             pX = noise.pXs[self.pI_id, cZ_id]
-                
+
         else:
-            cZ = self.cZ
-            pX = self.pX
-        
-        # Update p
-        p = jnp.array([self.pI, pX, pX, pX**cZ])
-        
-        # Update p_mu
-        p_mu = p[1] ** jnp.sum(self.H_X - self.H_Y, axis=1) * p[2] ** jnp.sum(self.H_Y, axis=1) * p[3] ** jnp.sum(self.H_Z - self.H_Y, axis=1) * p[0] ** (self.n_qubits_physical - jnp.sum(self.H_X - self.H_Y + self.H_Z, axis=1)) 
+            cZ = np.float32(self.cZ)
+            pX = np.float32(self.pX)
+
+        # Update p (float32 like the JAX original)
+        p = np.array([np.float32(self.pI), pX, pX, pX**cZ], dtype=np.float32)
+
+        # Update p_mu (NumPy float32 arithmetic, then to torch)
+        p_mu = p[1] ** np.sum(self.H_X - self.H_Y, axis=1).astype(np.float32) * p[2] ** np.sum(self.H_Y, axis=1).astype(np.float32) * p[3] ** np.sum(self.H_Z - self.H_Y, axis=1).astype(np.float32) * p[0] ** (self.n_qubits_physical - np.sum(self.H_X - self.H_Y + self.H_Z, axis=1)).astype(np.float32)
         # Normalize p_mu
-        p_mu /= jnp.max(p_mu)        
+        p_mu = p_mu / np.max(p_mu)
 
         state = EnvState(
             tableau = init_state,
             time = 0,
             cZ = cZ,
-            p_mu = p_mu,
+            p_mu = torch.from_numpy(p_mu),
         )
-        
+
         return self.get_obs(state), state
 
-    def get_obs(self, state: EnvState, params: Optional[EnvParams] = EnvParams) -> chex.Array:
+    def get_obs(self, state: EnvState, params: Optional[EnvParams] = EnvParams) -> torch.Tensor:
         """Applies observation function to state."""
-        
+
         return self.get_observation(state.tableau, state.cZ).flatten()
 
     def is_terminal(self, state: EnvState, params: EnvParams) -> bool:
         """Check whether state is terminal."""
         # Check termination criteria
-        done_encoding = jnp.abs(self.num_KL) <= self.threshold
-        
+        done_encoding = np.abs(self.num_KL) <= self.threshold
+
         # Check number of steps in episode termination condition
         done_steps = state.time >= self.max_steps
-        
-        done = jnp.logical_or(done_encoding, done_steps)
-        return done
+
+        done = np.logical_or(done_encoding, done_steps)
+        return bool(done)
 
     @property
     def name(self) -> str:
@@ -385,14 +395,14 @@ class MetaCodeDiscovery(environment.Environment):
     def observation_space(self, params: EnvParams) -> spaces.Box:
         """Observation space of the environment."""
 
-        return spaces.Box(0, 2, self.obs_shape, dtype=jnp.float32)
+        return spaces.Box(0, 2, self.obs_shape, dtype=torch.float32)
 
     def state_space(self, params: EnvParams) -> spaces.Dict:
         """State space of the environment."""
 
         return spaces.Dict(
             {
-                "tableau": spaces.Box(0, 1, self.obs_shape, jnp.uint8),
+                "tableau": spaces.Box(0, 1, self.obs_shape, torch.uint8),
                 "time": spaces.Discrete(params.max_steps),
             }
         )

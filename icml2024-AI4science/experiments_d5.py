@@ -6,7 +6,6 @@ import json
 import stim
 import matplotlib.pyplot as plt
 import numpy as np
-import jax.numpy as jnp
 from qiskit import QuantumCircuit
 
 def convert_stim_to_qiskit_circuit(encoding_circuit):
