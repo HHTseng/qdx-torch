@@ -1,15 +1,18 @@
+from functools import lru_cache
 from qdx.torch_env_base import Environment, spaces
 import numpy as np
 import torch
 from dataclasses import dataclass
 from inspect import signature
 from typing import Tuple, Optional
-import itertools
+from itertools import combinations, product
+from math import comb
+from qdx.runtime_cache import (
+    build_error_operators_upto,
+    build_s_structure,
+    load_or_build_array_bundle,
+)
 from qdx.simulators import TableauSimulator
-import stim
-from more_itertools import distinct_permutations
-from itertools import combinations
-import scipy.special as ss
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,8 @@ class CodeDiscovery(Environment):
         pI (float, optional): Probability of no error in the noise channel. Default: 0.9
         softness (int, optional): Parameter that controls the size of the stabilizer subgroup to be generated. Default: 1
     """
+    _ACTION_MATRIX_MEMORY_CACHE = {}
+
     def __init__(self,
             n_qubits_physical,
             n_qubits_logical,
@@ -86,11 +91,11 @@ class CodeDiscovery(Environment):
         self.actions = self.action_matrix()
 
         # Symplectic metric Omega
-        self.Omega = torch.from_numpy(
-            np.kron(np.array([[0,1],[1,0]], dtype=np.uint8), np.eye(n_qubits_physical, dtype=np.uint8)))
+        self.Omega = self._cached_omega(self.n_qubits_physical)
 
         # Initialize error operators and probabilities
         self.E_mu, self.p_mu = self.error_operators()
+        self.E_mu_Omega = self.E_mu @ self.Omega
 
         # Initialize stabilizer group structure
         self.generate_S_structure(softness) # This generates self.S_struct
@@ -108,36 +113,58 @@ class CodeDiscovery(Environment):
         # Generate the structure of the stabilizer group (S) based on the softness parameter.
 
         num = self.n_qubits_physical - self.n_qubits_logical
+        self.S_struct = self._cached_s_structure(num, int(softness))
 
-        # Calculate the number of stabilizer elements
-        soft_elements = int(sum([ss.binom(num,i) for i in range(1,softness+1)]))
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _cached_omega(n_qubits_physical):
+        return torch.from_numpy(
+            np.kron(
+                np.array([[0, 1], [1, 0]], dtype=np.uint8),
+                np.eye(n_qubits_physical, dtype=np.uint8),
+            )
+        )
 
-        # Create an array of zeros
-        S_struct = np.zeros((soft_elements, num), dtype=int)
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _cached_s_structure(num_stabilizers, softness):
+        arrays = load_or_build_array_bundle(
+            "code_discovery_s_structure",
+            {
+                "num_stabilizers": int(num_stabilizers),
+                "softness": int(softness),
+            },
+            lambda: {
+                "s_struct": build_s_structure(num_stabilizers, softness),
+            },
+        )
+        return torch.from_numpy(np.ascontiguousarray(arrays["s_struct"]))
 
-        # Book-keeping
-        start_idx = 0
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _cached_error_operators(n_qubits_physical, code_distance, p_identity):
+        def build():
+            error_ops, probabilities = build_error_operators_upto(
+                n_qubits_physical, code_distance, p_identity
+            )
+            return {
+                "error_ops": error_ops,
+                "probabilities": probabilities,
+            }
 
-        for m in range(1,softness+1):
-
-            # Generate combinations of indices to place ones in the S structure
-            comb = list(combinations(range(num),m))
-            indices = np.array(comb)
-
-            # Fill the S structure with ones at the specified indices
-            for i,idx in enumerate(indices):
-                S_struct[start_idx+i, idx] = 1
-
-            # Update the start_idx
-            start_idx += i+1
-
-        # Ensure there are no rows with all zeroes in the S structure
-        assert np.prod(np.any(S_struct, axis=1)), "There is a row with all zeroes"
-
-        # Convert the S structure to a uint8 torch tensor for efficient computation
-        self.S_struct = torch.from_numpy(S_struct.astype(np.uint8))
-
-        return
+        arrays = load_or_build_array_bundle(
+            "code_discovery_error_operators",
+            {
+                "n_qubits_physical": int(n_qubits_physical),
+                "code_distance": int(code_distance),
+                "p_identity": float(p_identity),
+            },
+            build,
+        )
+        return (
+            torch.from_numpy(np.ascontiguousarray(arrays["error_ops"])),
+            torch.from_numpy(np.ascontiguousarray(arrays["probabilities"])),
+        )
 
     def stabilizer_elements(self, tableau):
         # Generate the S matrix by multiplying the S structure with the tableau
@@ -146,29 +173,66 @@ class CodeDiscovery(Environment):
 
     def action_matrix(self,
                       params: Optional[EnvParams] = EnvParams) -> torch.Tensor:
+        gate_names = tuple(
+            f"{gate.__module__}.{gate.__qualname__}" for gate in self.gates
+        )
+        graph_edges = tuple((int(src), int(dst)) for src, dst in self.graph)
+        memory_key = (int(self.n_qubits_physical), gate_names, graph_edges)
+        cached = self._ACTION_MATRIX_MEMORY_CACHE.get(memory_key)
+        if cached is None:
+            def build():
+                action_matrix = []
+                action_string = []
+                action_string_stim = []
 
-        action_matrix = []
-        self.action_string = []
-        self.action_string_stim = []
+                for gate in self.gates:
+                    if len(signature(gate).parameters) == 1:
+                        for n_qubit in range(self.n_qubits_physical):
+                            action_matrix.append(np.asarray(gate(n_qubit)))
+                            action_string.append('%s-%d' % (gate.__name__, n_qubit))
+                            action_string_stim.append(
+                                '.%s(%d)' % (gate.__name__.lower(), n_qubit)
+                            )
+                    elif len(signature(gate).parameters) == 2:
+                        for edge in self.graph:
+                            action_matrix.append(np.asarray(gate(edge[0], edge[1])))
+                            action_string.append(
+                                '%s-%d-%d' % (gate.__name__, edge[0], edge[1])
+                            )
+                            action_string_stim.append(
+                                '.%s(%d, %d)'
+                                % (gate.__name__.lower(), edge[0], edge[1])
+                            )
 
-        for gate in self.gates:
-            ## One qubit gate
-            if len(signature(gate).parameters) == 1:
-                for n_qubit in range(self.n_qubits_physical):
-                    action_matrix.append(gate(n_qubit))
-                    self.action_string.append('%s-%d' % (gate.__name__, n_qubit))
-                    self.action_string_stim.append('.%s(%d)' % (gate.__name__.lower(), n_qubit))
+                return {
+                    "actions": np.asarray(action_matrix, dtype=np.uint8),
+                    "action_string": np.asarray(action_string),
+                    "action_string_stim": np.asarray(action_string_stim),
+                }
 
+            arrays = load_or_build_array_bundle(
+                "code_discovery_action_matrix",
+                {
+                    "n_qubits_physical": int(self.n_qubits_physical),
+                    "gate_names": gate_names,
+                    "graph_edges": graph_edges,
+                },
+                build,
+            )
+            cached = (
+                torch.from_numpy(np.ascontiguousarray(arrays["actions"])),
+                tuple(str(value) for value in arrays["action_string"].tolist()),
+                tuple(
+                    str(value)
+                    for value in arrays["action_string_stim"].tolist()
+                ),
+            )
+            self._ACTION_MATRIX_MEMORY_CACHE[memory_key] = cached
 
-            ## Two qubit gates
-            elif len(signature(gate).parameters) == 2:
-                for edge in self.graph:
-                    action_matrix.append(gate(edge[0], edge[1]))
-                    self.action_string.append('%s-%d-%d' % (gate.__name__, edge[0], edge[1]))
-                    self.action_string_stim.append('.%s(%d, %d)' % (gate.__name__.lower(), edge[0], edge[1]))
-
-
-        return torch.stack(action_matrix).to(torch.uint8)
+        actions, action_string, action_string_stim = cached
+        self.action_string = list(action_string)
+        self.action_string_stim = list(action_string_stim)
+        return actions
 
     def get_observation(self, tableau):
         '''
@@ -180,36 +244,13 @@ class CodeDiscovery(Environment):
         return check_mat
 
     def error_operators(self, params: Optional[EnvParams] = EnvParams) -> torch.Tensor:
-
-        error_list = [1,2,3] # Corresponds to X,Y,Z
-
-        results = []
-
-        for weight in range(1, self.d):
-            # Generate all combinations of errors with repetition based on the current weight
-            prod = list(list(tup) for tup in itertools.combinations_with_replacement(error_list, weight))
-
-            # Pad the error list to match the number of physical qubits
-            prod = [pr + [0] * (self.n_qubits_physical - weight) for pr in prod]
-
-            # Generate distinct permutations of each product to form the error structure
-            result = list(list(distinct_permutations(pr, self.n_qubits_physical)) for pr in prod)
-            results.append(list(itertools.chain(*result)))
-
-        error_structure = list(itertools.chain(*results))
-
-        # Convert error structure to a torch tensor for efficient computation
-        E_mu = torch.from_numpy(
-            np.array([np.array(stim.PauliString(p).to_numpy()).flatten() for p in error_structure], dtype=np.uint8))
-
-        # p_X = p_Y = p_Z by assumption
-        p_channel = np.array([self.pI] + [(1.-self.pI)/3.]*3, dtype=np.float32)
-
-        # Generate p_mu using p_channel and error_structure
-        p_mu = torch.from_numpy(
-            np.array([np.prod(p_channel[np.array(error_pauli_character)]) for error_pauli_character in error_structure], dtype=np.float32))
-
-        return E_mu, p_mu
+        # Build symplectic X/Z bits directly instead of going through Python
+        # permutations and Stim PauliString objects for every operator.
+        return self._cached_error_operators(
+            self.n_qubits_physical,
+            self.d,
+            float(self.pI),
+        )
 
 
     def check_KL(self, state: EnvState, params: Optional[EnvParams] = EnvParams):
@@ -222,17 +263,22 @@ class CodeDiscovery(Environment):
         S = self.stabilizer_elements(check_matrix)
 
         # Determine if errors are in S by calculating the logical XOR between S and error operators, E_mu
-        # (vectorized equivalent of jax.vmap(jnp.logical_xor, in_axes=(None, 0))(S, E_mu))
         inS = torch.logical_xor(S[None, :, :], self.E_mu[:, None, :])
         inS = torch.logical_not(inS).all(dim=-1).to(torch.int32)
+        inS_per_error = torch.sum(inS, dim=-1)
+
+        # Reuse the symplectic product result across the KL count and reward.
+        violations = torch.any((self.E_mu_Omega @ check_matrix.T) % 2, dim=1)
 
         # Calculate the number of Knill-Laflamme conditions that are not satisfied. This is used for stopping criterion
-        anticommutes = torch.any(((self.E_mu @ self.Omega) @ check_matrix.T)%2, dim=1)
-        self.num_KL = int(len(self.E_mu) - torch.sum(anticommutes, dim=0) - torch.sum(inS))
+        self.num_KL = int(len(self.E_mu) - torch.sum(violations, dim=0) - torch.sum(inS_per_error))
 
         # Return the weighted KL sum rescaled by lbda (as a float32 scalar)
-        rew = ( torch.sum(self.p_mu) - torch.sum(self.p_mu * anticommutes, dim=0)
-                - torch.dot(self.p_mu, torch.sum(inS, dim=-1).to(torch.float32)) )
+        rew = (
+            torch.sum(self.p_mu)
+            - torch.sum(self.p_mu * violations, dim=0)
+            - torch.dot(self.p_mu, inS_per_error.to(torch.float32))
+        )
         return np.float32(self.lbda) * np.float32(rew.item())
 
     def step_env(

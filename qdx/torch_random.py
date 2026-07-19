@@ -226,6 +226,33 @@ def gumbel(key, shape=()):
     return -np.log(-np.log(u))
 
 
+def truncated_normal(key, lower, upper, shape=()):
+    """float32 truncated normal, matching jax.random.truncated_normal."""
+    import math
+
+    sqrt2 = np.float32(np.sqrt(2))
+    lower = np.float32(lower)
+    upper = np.float32(upper)
+    a = np.float32(math.erf(np.float32(lower / sqrt2)))
+    b = np.float32(math.erf(np.float32(upper / sqrt2)))
+    u = uniform(key, shape, a, b)
+    out = sqrt2 * _erfinv_f32(u)
+    # jax clips to the open interval just inside (lower, upper)
+    lo = np.nextafter(lower, np.float32(np.inf))
+    hi = np.nextafter(upper, np.float32(-np.inf))
+    return np.clip(out, lo, hi).astype(np.float32)
+
+
+def lecun_normal_init(key, shape):
+    """flax's default Dense kernel init: variance_scaling(1.0, 'fan_in',
+    'truncated_normal') for a kernel of shape (fan_in, fan_out)."""
+    fan_in = shape[0]
+    variance = np.float32(1.0) / np.float32(max(1, fan_in))
+    # jax divides by the truncated-normal stddev correction constant
+    stddev = np.float32(np.sqrt(variance)) / np.float32(0.87962566103423978)
+    return (truncated_normal(key, -2.0, 2.0, shape) * stddev).astype(np.float32)
+
+
 def categorical(key, logits, axis=-1, shape=None):
     """Gumbel-max categorical sampling, matching jax.random.categorical."""
     logits = np.asarray(logits, dtype=np.float32)

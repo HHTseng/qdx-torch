@@ -1,102 +1,138 @@
+from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
+
 import numpy as np
 import torch
-import stim
-import itertools
-from more_itertools import distinct_permutations
 
-import scipy.special as ss
-from itertools import combinations
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - depends on the runtime env
+    yaml = None
+
+from qdx.envs.graph_code_discovery import GraphCodeDiscovery
+from qdx.runtime_cache import (
+    build_exact_weight_error_operators,
+    build_s_structure,
+    load_or_build_array_bundle,
+)
+from qdx.gnn import GraphPadding
+from qdx.make_train import make_actor_critic
 from qdx.simulators import TableauSimulator
+from qdx.simulators.clifford_gates import CliffordGates
 
-class Utils():
 
-    def __init__(self,
-                 n,
-                 k,
-                 gates,
-                 softness,
-                ):
+BASE_CONFIG = {
+    "MODEL": "GNN",
+    "ENV_TYPE": "STANDARD",
+    "D": 3,
+    "MAX_STEPS": 50,
+    "WHICH_GATES": ("cx", "h", "s", "sqrt_x", "cz", "sqrt_xx"),
+    "GRAPH": "All-to-All",
+    "SOFTNESS": 1,
+    "VALIDATION_SOFTNESS": None,
+    "P_I": 0.9,
+    "LAMBDA": 10,
+    "SEED": 42,
+    "LR": 1.0e-3,
+    "NUM_ENVS_PER_TASK": 16,
+    "NUM_STEPS": 50,
+    "TOTAL_TIMESTEPS": 2_000_000,
+    "UPDATE_EPOCHS": 3,
+    "NUM_MINIBATCHES": 4,
+    "GAMMA": 0.99,
+    "GAE_LAMBDA": 0.95,
+    "CLIP_EPS": 0.2,
+    "ENT_COEF": 0.02,
+    "VF_COEF": 0.5,
+    "MAX_GRAD_NORM": 0.25,
+    "ACTIVATION": "relu",
+    "HIDDEN_DIM": 32,
+    "ANNEAL_LR": True,
+    "COMPUTE_METRICS": True,
+    "GNN_HIDDEN_DIM": 64,
+    "GNN_RELATION_DIM": 8,
+    "GNN_GATE_DIM": 8,
+    "GNN_NUM_LAYERS": 3,
+    "DEVICE": "cpu",
+}
 
-        self.n_qubits_physical = n # Number of physical qubits
-        self.n_qubits_logical = k # Number of logical qubits
+DEFAULT_TRAIN_TASKS = ((5, 1, 3),)
+DEFAULT_VALIDATION_TASKS = ((5, 1, 3), (6, 1, 3))
+DEFAULT_GRAPHS = ("All-to-All", "NN-1", "NN-2")
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "main.yaml"
 
-        # Initialize the tableau simulator with the number of physical qubits and apply gates
+
+class Utils:
+
+    def __init__(self, n, k, gates, softness):
+        self.n_qubits_physical = n
+        self.n_qubits_logical = k
+
         tableau_simulator = TableauSimulator(self.n_qubits_physical)
-        for g in gates:
-            # Dynamically execute the gate commands on the tableau simulator
-            eval("tableau_simulator%s" % g)
+        for gate in gates:
+            eval(f"tableau_simulator{gate}")
 
-        # Extract the current tableau state after applying gates
         self.tableau = tableau_simulator.current_tableau[0]
+        self.generate_S_structure(softness)
+        self.S = self.generate_S(
+            self.tableau[self.n_qubits_physical + self.n_qubits_logical :]
+        )
+        self.Omega = self._cached_omega(self.n_qubits_physical)
 
-        # Generate the stabilizer group structure for stabilizer calculations
-        self.generate_S_structure(softness) # This generates self.S_struct
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _cached_omega(n_qubits_physical):
+        return torch.from_numpy(
+            np.kron(
+                np.array([[0, 1], [1, 0]], dtype=np.uint8),
+                np.eye(n_qubits_physical, dtype=np.uint8),
+            )
+        )
 
-        self.S = self.generate_S(self.tableau[self.n_qubits_physical + self.n_qubits_logical:])
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _cached_s_structure(num_stabilizers, softness):
+        arrays = load_or_build_array_bundle(
+            "utils_s_structure",
+            {
+                "num_stabilizers": int(num_stabilizers),
+                "softness": int(softness),
+            },
+            lambda: {
+                "s_struct": build_s_structure(num_stabilizers, softness),
+            },
+        )
+        return torch.from_numpy(np.ascontiguousarray(arrays["s_struct"]))
 
-        # Symplectic metric Omega
-        self.Omega = torch.from_numpy(
-            np.kron(np.array([[0,1],[1,0]], dtype=np.uint8), np.eye(self.n_qubits_physical, dtype=np.uint8)))
-
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _cached_exact_weight_error_operators(n_qubits_physical, eval_weight):
+        arrays = load_or_build_array_bundle(
+            "utils_exact_weight_error_operators",
+            {
+                "n_qubits_physical": int(n_qubits_physical),
+                "eval_weight": int(eval_weight),
+            },
+            lambda: {
+                "error_ops": build_exact_weight_error_operators(
+                    n_qubits_physical, eval_weight
+                ),
+            },
+        )
+        return torch.from_numpy(np.ascontiguousarray(arrays["error_ops"]))
 
     def error_operators(self, eval_weight) -> torch.Tensor:
-        # Generate error operators based on the evaluation weight.
-
-        error_list = [1,2,3] # Corresponds to X,Y,Z
-
-        # Generate all combinations of errors with repetition based on eval_weight
-        prod = list(list(tup) for tup in itertools.combinations_with_replacement(error_list, eval_weight))
-
-        # Pad the error list to match the number of physical qubits
-        prod = [pr + [0] * (self.n_qubits_physical - eval_weight) for pr in prod]
-
-        # Generate distinct permutations of each product to form the error structure
-        result = list(list(distinct_permutations(pr, self.n_qubits_physical)) for pr in prod)
-        error_structure = list(itertools.chain(*result))
-
-        # Convert error structure to a torch tensor for efficient computation
-        E_mu = torch.from_numpy(
-            np.array([np.array(stim.PauliString(p).to_numpy()).flatten() for p in error_structure], dtype=np.uint8))
-
-        return E_mu
+        return self._cached_exact_weight_error_operators(
+            self.n_qubits_physical,
+            eval_weight,
+        )
 
     def generate_S_structure(self, softness):
-        # Generate the structure of the stabilizer group (S) based on the softness parameter.
-
         num = self.n_qubits_physical - self.n_qubits_logical
-
-        # Calculate the number of stabilizer elements
-        soft_elements = int(sum([ss.binom(num,i) for i in range(1,softness+1)]))
-
-        # Create an array of zeros
-        S_struct = np.zeros((soft_elements, num), dtype=int)
-
-        # Book-keeping
-        start_idx = 0
-
-        for m in range(1,softness+1):
-
-            # Generate combinations of indices to place ones in the S structure
-            comb = list(combinations(range(num),m))
-            indices = np.array(comb)
-
-            # Fill the S structure with ones at the specified indices
-            for i,idx in enumerate(indices):
-                S_struct[start_idx+i, idx] = 1
-
-            # Update the start_idx
-            start_idx += i+1
-
-        # Ensure there are no rows with all zeroes in the S structure
-        assert np.prod(np.any(S_struct, axis=1)), "There is a row with all zeroes"
-
-        # Convert the S structure to a uint8 torch tensor for efficient computation
-        self.S_struct = torch.from_numpy(S_struct.astype(np.uint8))
-
-        return
+        self.S_struct = self._cached_s_structure(num, int(softness))
 
     def generate_S(self, tableau):
-        # Generate the S matrix by multiplying the S structure with the tableau
         return (self.S_struct @ tableau) % 2
 
     def remove_rows(self, arr, row_indices):
@@ -104,57 +140,446 @@ class Utils():
         mask[torch.as_tensor(row_indices)] = 0
         mask = mask.to(torch.bool)
 
-        a = torch.as_tensor(row_indices).shape[0]
-        b,c = arr.shape
-        # return arr * mask
-        return arr[mask].reshape(b-a,c)
+        row_count = torch.as_tensor(row_indices).shape[0]
+        total_rows, width = arr.shape
+        return arr[mask].reshape(total_rows - row_count, width)
 
     def check_KL(self, E_mu):
-        # Check the Knill-Laflamme conditions for error correction.
-
-        # Determine if errors are in S by calculating the logical XOR between S and error operators, E_mu
-        # (vectorized equivalent of jax.vmap(jnp.logical_xor, in_axes=(None, 0))(S, E_mu))
         inS = torch.logical_xor(self.S[None, :, :], E_mu[:, None, :])
         inS = torch.logical_not(inS).all(dim=-1).to(torch.int32)
 
-        # Calculate the number of Knill-Laflamme conditions that are not satisfied
-        num_KL = len(E_mu) - int(torch.sum(torch.any(((E_mu @ self.Omega) @ self.tableau[self.n_qubits_physical + self.n_qubits_logical:].T)%2, dim=1), dim=0)) - int(torch.sum(inS))
-
-        return num_KL # np.min(KLs), np.argmin(KLs)
+        num_KL = (
+            len(E_mu)
+            - int(torch.sum(
+                torch.any(
+                    (
+                        (E_mu @ self.Omega)
+                        @ self.tableau[
+                            self.n_qubits_physical + self.n_qubits_logical :
+                        ].T
+                    )
+                    % 2,
+                    dim=1,
+                ),
+                dim=0,
+            ))
+            - int(torch.sum(inS))
+        )
+        return num_KL
 
     def check_KL_cZ(self, E_mu, cZ):
-        # Check the Knill-Laflamme conditions specifically considering a biased error channel with bias parameter cZ
+        h_x = E_mu[:, : self.n_qubits_physical]
+        h_z = E_mu[:, self.n_qubits_physical :]
+        h_y = h_x * h_z
+        effective_weights = (
+            torch.sum(h_x - h_y, dim=1).to(torch.float32)
+            + torch.sum(h_y, dim=1).to(torch.float32)
+            + float(np.float32(cZ)) * torch.sum(h_z - h_y, dim=1).to(torch.float32)
+        )
 
-        # Separate X,Y,Z part of errors for effective weight computation
-        H_X = E_mu[:,:self.n_qubits_physical]
-        H_Z = E_mu[:,self.n_qubits_physical:]
-        H_Y = H_X * H_Z
-
-        # Calculate the effective weights (float32, matching the JAX original)
-        effective_weights = torch.sum(H_X - H_Y, dim=1).to(torch.float32) + torch.sum(H_Y, dim=1).to(torch.float32) + float(np.float32(cZ))*torch.sum(H_Z - H_Y, dim=1).to(torch.float32)
-
-        # Extract the stabilizer generators
-        tableau = self.tableau[self.n_qubits_physical + self.n_qubits_logical:]
-
-        # Determine if errors are in S by calculating the logical XOR between S and error operators, E_mu
-        # (vectorized equivalent of jax.vmap(jnp.logical_xor, in_axes=(None, 0))(S, E_mu))
+        tableau = self.tableau[self.n_qubits_physical + self.n_qubits_logical :]
         inS = torch.logical_xor(self.S[None, :, :], E_mu[:, None, :])
         inS = torch.logical_not(inS).all(dim=-1).to(torch.int32)
 
-        # Check which error operators don't satisfy the Knill-Laflamme conditions
-        KL1 = effective_weights * torch.logical_not(torch.any((E_mu @ self.Omega @ tableau.T)%2, dim=1))
-        KL2 = effective_weights * torch.sum(inS, dim=1).to(torch.float32)
-        KLs = KL1 - KL2
+        kl1 = effective_weights * torch.logical_not(
+            torch.any((E_mu @ self.Omega @ tableau.T) % 2, dim=1)
+        )
+        kl2 = effective_weights * torch.sum(inS, dim=1).to(torch.float32)
+        kls = kl1 - kl2
 
-        # Identify non-zero Knill-Laflamme values (the ones that don't satisfy KL)
-        non_zero_ids = torch.nonzero(KLs, as_tuple=True)[0]
-
-        # Determine the smallest undetected effective weight
-        if len(KLs[non_zero_ids]) > 0:
-            smallest_undetected_effective_weight = torch.min(KLs[non_zero_ids])
-
-        # If all errors are detected, return a large number (it will be discarded anyway)
+        non_zero_ids = torch.nonzero(kls, as_tuple=True)[0]
+        if len(kls[non_zero_ids]) > 0:
+            smallest_undetected_effective_weight = torch.min(kls[non_zero_ids])
         else:
             smallest_undetected_effective_weight = 100
 
-        return round(float(smallest_undetected_effective_weight),2)
+        return round(float(smallest_undetected_effective_weight), 2)
+
+
+def all_to_all_graph(n):
+    return [(i, j) for i in range(n) for j in range(n) if i != j]
+
+
+def nn_1_graph(n):
+    graph = []
+    for i in range(n - 1):
+        graph.append((i, i + 1))
+        graph.append((i + 1, i))
+    return graph
+
+
+def nn_2_graph(n):
+    graph = nn_1_graph(n)
+    for i in range(n - 2):
+        graph.append((i, i + 2))
+        graph.append((i + 2, i))
+    return graph
+
+
+def normalize_graph_name(graph_name):
+    graph_name = str(graph_name).strip()
+    if graph_name not in DEFAULT_GRAPHS:
+        supported = ", ".join(DEFAULT_GRAPHS)
+        raise ValueError(f"unsupported graph {graph_name!r}; choose from {supported}")
+    return graph_name
+
+
+def build_hardware_graph(n, graph_name):
+    graph_name = normalize_graph_name(graph_name)
+    if graph_name == "All-to-All":
+        return all_to_all_graph(n)
+    if graph_name == "NN-1":
+        return nn_1_graph(n)
+    if graph_name == "NN-2":
+        return nn_2_graph(n)
+    raise ValueError(f"unsupported graph {graph_name!r}")
+
+
+def make_env(n, k, d, config, graph_padding, graph_name=None):
+    graph_name = normalize_graph_name(
+        config["GRAPH"] if graph_name is None else graph_name
+    )
+    gates = CliffordGates(n)
+    gate_set = [getattr(gates, gate_name) for gate_name in config["WHICH_GATES"]]
+    return GraphCodeDiscovery(
+        n,
+        k,
+        d,
+        gate_set,
+        graph=build_hardware_graph(n, graph_name),
+        max_steps=config["MAX_STEPS"],
+        lbda=config["LAMBDA"],
+        pI=config["P_I"],
+        softness=config["SOFTNESS"],
+        graph_padding=graph_padding,
+    )
+
+
+def build_task_config(base_config, task):
+    task_config = dict(base_config)
+    task_config["D"] = task["d"]
+    task_config["GRAPH"] = task["graph"]
+    return task_config
+
+
+def make_task_env(task, config, graph_padding):
+    return make_env(
+        task["n"],
+        task["k"],
+        task["d"],
+        config,
+        graph_padding,
+        graph_name=task["graph"],
+    )
+
+
+def normalize_task_specs(task_specs, default_task_specs, graphs):
+    raw_specs = default_task_specs if task_specs is None else task_specs
+    default_graphs = tuple(
+        dict.fromkeys(normalize_graph_name(graph_name) for graph_name in graphs)
+    )
+    if not default_graphs:
+        raise ValueError("at least one graph is required")
+
+    normalized = []
+    for task in raw_specs:
+        task_graph = None
+        task_graphs = None
+        if isinstance(task, dict):
+            n = task["n"]
+            k = task["k"]
+            d = task.get("d", task.get("target_distance", BASE_CONFIG["D"]))
+            task_graph = task.get("graph")
+            task_graphs = task.get("graphs")
+        else:
+            if len(task) not in (3, 4):
+                raise ValueError(
+                    "task specs must be 3-tuples (n, k, d) or 4-tuples (n, k, d, graph)"
+                )
+            n, k, d = task[:3]
+            if len(task) == 4:
+                task_graph = task[3]
+
+        n = int(n)
+        k = int(k)
+        d = int(d)
+        if n <= 0 or k <= 0 or d <= 0:
+            raise ValueError("task values must be positive integers")
+        if k >= n:
+            raise ValueError(f"task {(n, k, d)} must satisfy k < n")
+
+        if task_graphs is not None:
+            graph_inputs = [task_graphs] if isinstance(task_graphs, str) else task_graphs
+            task_graph_names = tuple(
+                dict.fromkeys(
+                    normalize_graph_name(graph_name) for graph_name in graph_inputs
+                )
+            )
+            if not task_graph_names:
+                raise ValueError("at least one graph is required")
+        elif task_graph is not None:
+            task_graph_names = (normalize_graph_name(task_graph),)
+        else:
+            task_graph_names = default_graphs
+
+        for graph_name in task_graph_names:
+            normalized.append({"n": n, "k": k, "d": d, "graph": graph_name})
+
+    if not normalized:
+        raise ValueError("at least one task is required")
+    return normalized
+
+
+def build_graph_padding(task_specs):
+    if not task_specs:
+        raise ValueError("at least one task is required to build graph padding")
+    max_n = max(task["n"] for task in task_specs)
+    max_stabilizers = max(task["n"] - task["k"] for task in task_specs)
+    max_hardware_edges = max(
+        len(build_hardware_graph(task["n"], task["graph"])) for task in task_specs
+    )
+    return GraphPadding(
+        n_max=max_n,
+        stabilizers_max=max_stabilizers,
+        hardware_edges_max=max_hardware_edges,
+    )
+
+
+def graph_padding_to_dict(graph_padding):
+    return {
+        "n_max": int(graph_padding.n_max),
+        "stabilizers_max": int(graph_padding.resolved_stabilizers_max),
+        "hardware_edges_max": int(graph_padding.resolved_hardware_edges_max),
+        "actions_max": (
+            None if graph_padding.actions_max is None else int(graph_padding.actions_max)
+        ),
+    }
+
+
+def format_task(task):
+    return f"GRAPH={task['graph']} N={task['n']} K={task['k']} D={task['d']}"
+
+
+def distance_error_stats_up_to_target(
+    n, k, gates, target_distance, softness=None
+):
+    max_softness = n - k
+    if max_softness < 1:
+        raise ValueError("distance checks require n > k")
+    resolved_softness = (
+        max_softness
+        if softness is None
+        else max(1, min(int(softness), max_softness))
+    )
+
+    utilities = Utils(n, k, gates, softness=resolved_softness)
+    distance_stats = []
+    first_failure = target_distance + 1
+    for weight in range(1, target_distance + 1):
+        error_operators = utilities.error_operators(weight)
+        error_count = int(utilities.check_KL(error_operators))
+        total_count = int(error_operators.shape[0])
+        error_rate = error_count / total_count if total_count else 0.0
+        distance_stats.append(
+            {
+                "d": weight,
+                "error_count": error_count,
+                "total_count": total_count,
+                "error_count_over_total": f"{error_count}/{total_count}",
+                "error_rate": error_rate,
+            }
+        )
+        if error_count != 0 and first_failure == target_distance + 1:
+            first_failure = weight
+    return first_failure, distance_stats
+
+
+def format_distance_stats(distance_stats):
+    if not distance_stats:
+        return "distance_stats=[]"
+    formatted = "; ".join(
+        (
+            f"d={item['d']} "
+            f"error_count/total_count={item['error_count_over_total']} "
+            f"error_rate={item['error_rate']:.2%}"
+        )
+        for item in distance_stats
+    )
+    return f"distance_stats=[{formatted}]"
+
+
+def aggregate_distance_stats(results):
+    stats_by_d = {}
+    for result in results:
+        for item in result.get("distance_stats", []) or []:
+            d = item["d"]
+            summary = stats_by_d.setdefault(
+                d,
+                {
+                    "d": d,
+                    "error_count": 0,
+                    "total_count": 0,
+                },
+            )
+            summary["error_count"] += item["error_count"]
+            summary["total_count"] += item["total_count"]
+
+    aggregated = []
+    for d in sorted(stats_by_d):
+        error_count = stats_by_d[d]["error_count"]
+        total_count = stats_by_d[d]["total_count"]
+        aggregated.append(
+            {
+                "d": d,
+                "error_count": error_count,
+                "total_count": total_count,
+                "error_count_over_total": f"{error_count}/{total_count}",
+                "error_rate": error_count / total_count if total_count else 0.0,
+            }
+        )
+    return aggregated
+
+
+def default_output_dir(run_name="demo_multitask_nkdg"):
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    return Path(__file__).resolve().parents[1] / "outputs" / f"{run_name}_{timestamp}"
+
+
+def load_yaml_config(config_path):
+    if yaml is None:
+        raise ModuleNotFoundError(
+            "PyYAML is required to load YAML configs. "
+            "Install it in the active environment, for example with "
+            "`pip install PyYAML`."
+        )
+
+    config_path = Path(config_path).expanduser()
+    with config_path.open("r", encoding="utf-8") as file:
+        return yaml.safe_load(file) or {}
+
+
+def load_run_settings(config_path):
+    raw_config = load_yaml_config(config_path)
+    config = {
+        key: raw_config.get(key.lower(), raw_config.get(key, value))
+        for key, value in BASE_CONFIG.items()
+    }
+    if "WHICH_GATES" in config and not isinstance(config["WHICH_GATES"], tuple):
+        config["WHICH_GATES"] = tuple(config["WHICH_GATES"])
+
+    graph_names = raw_config.get("graphs", DEFAULT_GRAPHS)
+    graph_names = [graph_names] if isinstance(graph_names, str) else graph_names
+    graphs = tuple(
+        dict.fromkeys(normalize_graph_name(graph_name) for graph_name in graph_names)
+    )
+    train_tasks = normalize_task_specs(
+        raw_config.get("train_tasks"), DEFAULT_TRAIN_TASKS, graphs
+    )
+    validation_tasks = normalize_task_specs(
+        raw_config.get("validation_tasks"), DEFAULT_VALIDATION_TASKS, graphs
+    )
+    output_dir_value = raw_config.get("output_dir")
+    output_dir = (
+        default_output_dir()
+        if output_dir_value in (None, "")
+        else Path(output_dir_value).expanduser()
+    )
+
+    return {
+        "config": config,
+        "config_path": str(Path(config_path).expanduser()),
+        "graphs": graphs,
+        "train_tasks": train_tasks,
+        "validation_tasks": validation_tasks,
+        "skip_validation": raw_config.get("skip_validation", False),
+        "skip_distance": raw_config.get("skip_distance", False),
+        "dry_run": raw_config.get("dry_run", False),
+        "output_dir": output_dir,
+    }
+
+
+def params_to_numpy_tree(params):
+    """Detach a nested dict of torch tensors into NumPy arrays for saving."""
+
+    if isinstance(params, dict):
+        return {key: params_to_numpy_tree(value) for key, value in params.items()}
+    return params.detach().cpu().numpy()
+
+
+def params_from_numpy_tree(tree, requires_grad=True):
+    """Rebuild a nested dict of torch tensors from saved NumPy arrays."""
+
+    if isinstance(tree, dict):
+        return {
+            key: params_from_numpy_tree(value, requires_grad)
+            for key, value in tree.items()
+        }
+    tensor = torch.from_numpy(np.ascontiguousarray(tree))
+    if requires_grad and tensor.is_floating_point():
+        tensor.requires_grad_(True)
+    return tensor
+
+
+def save_params(params_path, params):
+    """Save a flax-style nested param dict as a compressed .npz archive."""
+
+    params_path = Path(params_path)
+    flat = {}
+
+    def _flatten(tree, prefix):
+        if isinstance(tree, dict):
+            for key, value in tree.items():
+                _flatten(value, prefix + (key,))
+        else:
+            flat["/".join(prefix)] = tree.detach().cpu().numpy()
+
+    _flatten(params, ())
+    np.savez_compressed(params_path, **flat)
+
+
+def load_params_from_path(params_path, config, reference_task, graph_padding):
+    """Load a params archive saved by :func:`save_params` into torch tensors."""
+
+    params_path = Path(params_path).expanduser()
+    with np.load(params_path, allow_pickle=False) as data:
+        flat = {name: data[name] for name in data.files}
+
+    params = {}
+    for name, value in flat.items():
+        node = params
+        parts = name.split("/")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+    loaded = params_from_numpy_tree(params)
+
+    # Validate against the template built for the requested architecture
+    task_config = build_task_config(config, reference_task)
+    env = make_task_env(reference_task, task_config, graph_padding)
+    network = make_actor_critic(task_config, env)
+    from qdx import torch_random
+
+    template = network.init(
+        torch_random.PRNGKey(0), env.graph_observation_template()
+    )
+
+    def _check(template_node, loaded_node, path):
+        if isinstance(template_node, dict):
+            if set(template_node.keys()) != set(loaded_node.keys()):
+                raise ValueError(
+                    "failed to load params into the validation network template; "
+                    "make sure the YAML model settings match the checkpoint "
+                    f"architecture (mismatch at {'/'.join(path) or 'root'})"
+                )
+            for key in template_node:
+                _check(template_node[key], loaded_node[key], path + (key,))
+        else:
+            if tuple(template_node.shape) != tuple(loaded_node.shape):
+                raise ValueError(
+                    "failed to load params into the validation network template; "
+                    f"shape mismatch at {'/'.join(path)}: "
+                    f"{tuple(loaded_node.shape)} vs {tuple(template_node.shape)}"
+                )
+
+    _check(template, loaded, ())
+    return loaded

@@ -1,5 +1,9 @@
 """Runs the full JAX-vs-PyTorch comparison suite.
 
+On the gnn-multitask-torch branch, point --jax-repo at the qdx_TCC0731_Jul18
+snapshot (the default): the standard environment and Utils adopt its direct
+error-operator ordering, and the GNN tests compare against its flax model.
+
 Usage:
     python tests/run_all.py [--jax-repo /path/to/qdx_jolle_ag]
                             [--torch-repo /path/to/qdx_jolle_ag_torch]
@@ -19,9 +23,11 @@ TESTS = [
     "test_simulators.py",
     "test_envs.py",
     "test_network.py",
+    "test_gnn_compare.py",
     "test_css_env.py",
     "test_end_to_end.py",
     "test_end_to_end_css.py",
+    "test_end_to_end_gnn.py",
 ]
 
 

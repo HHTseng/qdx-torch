@@ -11,21 +11,26 @@ from qdx import torch_random
 from qdx import torch_nn
 from qdx.torch_nn import Categorical, apply_actor_critic
 from qdx.torch_env_base import FlattenObservationWrapper, LogWrapper
+from qdx.gnn.model import GNNQDXActorCritic
+from qdx.gnn.observation import (
+    GraphObservation,
+    obs_index,
+    obs_map,
+    obs_reshape_lead,
+    obs_stack,
+    obs_take,
+    obs_to_device,
+)
 
 
 """
 This code is a faithful PyTorch port of the JAX/PureJaxRL implementation
-(https://github.com/luchris429/purejaxrl). The `jax.lax.scan`/`jax.vmap`
-constructs are replaced by explicit Python loops, `flax`/`distrax` by the
-torch modules in qdx.torch_nn, `jax.value_and_grad` by torch autograd,
-`optax` by the equivalent optimizer in qdx.torch_nn, and `jax.random` by
-the bit-exact threefry implementation in qdx.torch_random.
-
-Every tensor (observations, trajectories, advantages, parameters,
-gradients) is an eagerly-evaluated torch.Tensor that can be inspected in a
-debugger at any point. Set config["DEVICE"] = "mps"/"cuda" to run the
-network and PPO update on an accelerator (default: "cpu", which matches
-the JAX CPU results numerically).
+(https://github.com/luchris429/purejaxrl), extended with the GNN-QDX policy
+factory. The `jax.lax.scan`/`jax.vmap` constructs are replaced by explicit
+Python loops, `flax`/`distrax` by the torch modules in qdx.torch_nn and
+qdx.gnn, `jax.value_and_grad` by torch autograd, `optax` by the equivalent
+optimizer in qdx.torch_nn, and `jax.random` by the bit-exact threefry
+implementation in qdx.torch_random.
 """
 
 
@@ -58,11 +63,32 @@ class Transition(NamedTuple):
     value: torch.Tensor
     reward: torch.Tensor
     log_prob: torch.Tensor
-    obs: torch.Tensor
+    obs: Any
     info: Any
 
 
-def make_train(config, env, network_params_init = None, env_params = None):
+def make_actor_critic(config, env):
+    """Construct the selected policy while keeping one PPO implementation."""
+
+    if config.get("MODEL", "MLP").upper() == "GNN":
+        if not hasattr(env, "graph_builder"):
+            raise ValueError("MODEL='GNN' requires GraphCodeDiscovery")
+        return GNNQDXActorCritic(
+            num_gate_types=env.graph_builder.num_gate_types,
+            hidden_dim=config.get("GNN_HIDDEN_DIM", config["HIDDEN_DIM"]),
+            relation_dim=config.get("GNN_RELATION_DIM", 8),
+            gate_dim=config.get("GNN_GATE_DIM", 8),
+            num_gnn_layers=config.get("GNN_NUM_LAYERS", 3),
+            activation=config["ACTIVATION"],
+        )
+    return ActorCritic(
+        env.action_space().n,
+        activation=config["ACTIVATION"],
+        hidden_dim=config["HIDDEN_DIM"],
+    )
+
+
+def make_train(config, env, network_params_init=None, env_params=None):
     config["NUM_EPOCHS"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -70,8 +96,15 @@ def make_train(config, env, network_params_init = None, env_params = None):
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
 
-    env = FlattenObservationWrapper(env)
+    use_gnn = config.get("MODEL", "MLP").upper() == "GNN"
+    base_env = env
+    if use_gnn:
+        init_x = base_env.graph_observation_template()
+    else:
+        env = FlattenObservationWrapper(env)
+        init_x = torch.zeros(env.observation_space(env_params).shape, dtype=torch.float32)
     env = LogWrapper(env)
+    network = make_actor_critic(config, base_env)
 
     num_envs = int(config["NUM_ENVS"])
     num_steps = int(config["NUM_STEPS"])
@@ -88,20 +121,22 @@ def make_train(config, env, network_params_init = None, env_params = None):
 
         return np.float32(config["LR"]) * frac
 
+    def _stack_obs(obs_list):
+        if use_gnn:
+            return obs_to_device(obs_stack(obs_list), device)
+        return torch.stack(obs_list).to(device)
+
     def train(rng, network_params_init=None):
 
         # INIT NETWORK
-        network = ActorCritic(env.action_space(env_params).n, activation=config["ACTIVATION"], hidden_dim = config["HIDDEN_DIM"])
         keys = torch_random.split(rng)
         rng, _rng = keys[0], keys[1]
-        init_x = torch.zeros(env.observation_space(env_params).shape, dtype=torch.float32)
 
         if network_params_init is None:
             network_params = network.init(_rng, init_x)
 
         else:
-            network_params = network_params_init # typically, network_params_init = train_state.params
-            print("IN")
+            network_params = network_params_init
 
         # Move parameters to the requested device
         network_params = torch_nn._tree_map(
@@ -125,7 +160,7 @@ def make_train(config, env, network_params_init = None, env_params = None):
             o, s = env.reset(reset_rng[i], env_params)
             obsv_list.append(o)
             env_state.append(s)
-        obsv = torch.stack(obsv_list).to(device)
+        obsv = _stack_obs(obsv_list)
 
         all_metrics = [] if config["COMPUTE_METRICS"] else None
 
@@ -142,7 +177,7 @@ def make_train(config, env, network_params_init = None, env_params = None):
             traj_value = torch.zeros((num_steps, num_envs), dtype=torch.float32, device=device)
             traj_reward = torch.zeros((num_steps, num_envs), dtype=torch.float32, device=device)
             traj_log_prob = torch.zeros((num_steps, num_envs), dtype=torch.float32, device=device)
-            traj_obs = torch.zeros((num_steps,) + tuple(obsv.shape), dtype=obsv.dtype, device=device)
+            traj_obs_steps = []
             traj_info = {}
 
             for t in range(num_steps):
@@ -178,16 +213,21 @@ def make_train(config, env, network_params_init = None, env_params = None):
                 traj_value[t] = value
                 traj_reward[t] = torch.from_numpy(reward_b).to(device)
                 traj_log_prob[t] = log_prob
-                traj_obs[t] = last_obs
-                for k in info_b[0].keys():
-                    if k not in traj_info:
-                        traj_info[k] = np.zeros(
+                traj_obs_steps.append(last_obs)
+                for key in info_b[0].keys():
+                    if key not in traj_info:
+                        traj_info[key] = np.zeros(
                             (num_steps, num_envs),
-                            dtype=np.asarray(info_b[0][k]).dtype)
-                    traj_info[k][t] = np.array([inf[k] for inf in info_b])
+                            dtype=np.asarray(info_b[0][key]).dtype)
+                    traj_info[key][t] = np.array([inf[key] for inf in info_b])
 
                 env_state = state_next
-                last_obs = torch.stack(obs_next).to(device)
+                last_obs = _stack_obs(obs_next)
+
+            if use_gnn:
+                traj_obs = obs_map(lambda *leaves: torch.stack(leaves), *traj_obs_steps)
+            else:
+                traj_obs = torch.stack(traj_obs_steps)
 
             # CALCULATE ADVANTAGE
             with torch.no_grad():
@@ -222,7 +262,10 @@ def make_train(config, env, network_params_init = None, env_params = None):
                 batch_size == config["NUM_STEPS"] * config["NUM_ENVS"]
             ), "batch size must be equal to number of steps * number of envs"
 
-            flat_obs = traj_obs.reshape((batch_size,) + tuple(traj_obs.shape[2:]))
+            if use_gnn:
+                flat_obs = obs_reshape_lead(traj_obs, (batch_size,))
+            else:
+                flat_obs = traj_obs.reshape((batch_size,) + tuple(traj_obs.shape[2:]))
             flat_action = traj_action.reshape(batch_size)
             flat_value = traj_value.reshape(batch_size)
             flat_log_prob = traj_log_prob.reshape(batch_size)
@@ -238,9 +281,14 @@ def make_train(config, env, network_params_init = None, env_params = None):
                 mb = config["MINIBATCH_SIZE"]
                 for m in range(num_minibatches):
                     idx = permutation[m * mb:(m + 1) * mb]
-                    (total_loss, aux), grads = torch_nn.ppo_loss_and_grad(
+                    if use_gnn:
+                        obs_mb = obs_take(flat_obs, idx)
+                    else:
+                        obs_mb = flat_obs[idx]
+                    (total_loss, aux), grads = torch_nn.ppo_loss_and_grad_generic(
+                        network.apply,
                         train_params,
-                        flat_obs[idx],
+                        obs_mb,
                         flat_action[idx],
                         flat_value[idx],
                         flat_log_prob[idx],
@@ -263,10 +311,31 @@ def make_train(config, env, network_params_init = None, env_params = None):
                 k: np.stack([m[k] for m in all_metrics])
                 for k in all_metrics[0].keys()
             }
-            # Average over environments, reshape and return samples
-            metric["returned_episode_returns"] = np.mean(metric["returned_episode_returns"], axis=-1).reshape(-1)[config["MAX_STEPS"]::config["MAX_STEPS"]]
+            done = metric["returned_episode"].astype(bool)
+            episode_lengths = metric["returned_episode_lengths"]
+            success = done & (episode_lengths < config["MAX_STEPS"])
+            episode_count = np.sum(done, axis=(1, 2))
+            success_count = np.sum(success, axis=(1, 2))
+            timeout_count = episode_count - success_count
+            with np.errstate(invalid="ignore"):
+                success_rate = np.where(
+                    episode_count > 0,
+                    success_count / np.maximum(episode_count, 1),
+                    np.nan,
+                )
 
-            metric["returned_episode_lengths"] = np.mean(metric["returned_episode_lengths"], axis=-1).reshape(-1)[config["MAX_STEPS"]::config["MAX_STEPS"]]
+            metric["episode_count"] = episode_count
+            metric["success_count"] = success_count
+            metric["timeout_count"] = timeout_count
+            metric["success_rate"] = success_rate
+
+            # Average over environments, reshape and return sampled tails.
+            metric["returned_episode_returns"] = np.mean(
+                metric["returned_episode_returns"], axis=-1
+            ).reshape(-1)[config["MAX_STEPS"]::config["MAX_STEPS"]]
+            metric["returned_episode_lengths"] = np.mean(
+                metric["returned_episode_lengths"], axis=-1
+            ).reshape(-1)[config["MAX_STEPS"]::config["MAX_STEPS"]]
 
             return {"params": train_params, "metrics": metric}
         else:

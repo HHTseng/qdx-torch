@@ -20,7 +20,7 @@ import sys
 import numpy as np
 
 # Module names that must be purged between repo switches
-_QDX_PREFIXES = ("qdx",)
+_QDX_PREFIXES = ("qdx", "main", "validation")
 _ICML_PREFIXES = ("simulators", "envs", "make_train", "code_finder",
                   "utils_css", "torch_random", "torch_nn", "torch_env_base")
 
@@ -37,10 +37,16 @@ def asnp(x):
 
 
 def default_repo_paths():
-    """(torch_repo, jax_repo) defaults relative to this file's location."""
+    """(torch_repo, jax_repo) defaults relative to this file's location.
+
+    On the gnn-multitask-torch branch the comparison baseline is the
+    qdx_TCC0731_Jul18 snapshot (its direct error-operator generation reorders
+    E_mu rows relative to the upstream qdx_jolle_ag repository, and this
+    branch adopts that ordering).
+    """
     here = os.path.dirname(os.path.abspath(__file__))
     torch_repo = os.path.dirname(here)
-    jax_repo = os.path.join(os.path.dirname(torch_repo), "qdx_jolle_ag")
+    jax_repo = os.path.join(os.path.dirname(torch_repo), "qdx_TCC0731_Jul18")
     return torch_repo, jax_repo
 
 

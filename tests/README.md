@@ -59,3 +59,18 @@ the onset.
 * The 60-epoch LONG-RUN diverges numerically (params ~0.07 apart) while
   still discovering the same code distances — the expected post-chaos-onset
   behaviour described above.
+
+## gnn-multitask-torch branch additions
+
+On this branch the comparison **baseline is the `qdx_TCC0731_Jul18` snapshot**
+(GNN multitask modification of qdx), checked out as a sibling directory. Its
+direct error-operator generation reorders `E_mu` rows relative to upstream
+`qdx_jolle_ag`, and this branch adopts that ordering, so all env/Utils
+comparisons target the TCC snapshot.
+
+| Test | Contents | Criterion |
+|---|---|---|
+| `test_gnn_compare.py` | padded graph observations (all 17 fields over a rollout), flax-default GNN init (lecun-normal via threefry), GNN forward (single + batched), categorical sampling, PPO loss + torch.autograd gradients vs `jax.value_and_grad`, greedy validation rollouts | ints/masks/samples **exact**; floats ≤ ~1e-6; grads ≤ 2e-5 |
+| `test_end_to_end_gnn.py` | `main.py`-style joint multitask training (3 tasks × 2 graphs) + full validation on both sides | episode/success counts **exact** (identical trajectories); losses/params ≤ 1e-4; validation gates/distances **exact** |
+| `test_gnn_qdx.py` | torch port of the TCC unit tests (shapes, features, aggregation, action mapping, one PPO update) | run with `python -m unittest tests.test_gnn_qdx` |
+| `bench_gpu_gnn.py` | GNN CPU-vs-GPU correctness + acceleration (single GPU) | run with `CUDA_VISIBLE_DEVICES=0 python tests/bench_gpu_gnn.py` |

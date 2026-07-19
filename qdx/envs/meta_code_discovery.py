@@ -148,6 +148,7 @@ class MetaCodeDiscovery(Environment):
 
         # Initialize error operators
         self.E_mu = self.error_operators()
+        self.E_mu_Omega = self.E_mu @ self.Omega
 
         # Separate X,Y,Z part of errors (NumPy uint8, used to compute p_mu in float32)
         E_mu_np = self.E_mu.numpy()
@@ -284,7 +285,8 @@ class MetaCodeDiscovery(Environment):
         inS = torch.logical_not(inS).all(dim=-1).to(torch.int32)
 
         # Calculate the number of Knill-Laflamme conditions that are not satisfied. This is used for stopping criterion
-        anticommutes = torch.any(((self.E_mu @ self.Omega) @ check_matrix.T)%2, dim=1)
+        # Reuse the symplectic product result across the KL count and reward.
+        anticommutes = torch.any((self.E_mu_Omega @ check_matrix.T) % 2, dim=1)
         self.num_KL = int(len(self.E_mu) - torch.sum(anticommutes, dim=0) - torch.sum(inS))
 
         p_mu = torch.as_tensor(state.p_mu, dtype=torch.float32)

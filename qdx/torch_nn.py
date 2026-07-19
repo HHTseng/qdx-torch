@@ -242,14 +242,48 @@ def ppo_loss(params, obs, action, old_value, old_log_prob, gae, targets, config)
     return total_loss, (value_loss, loss_actor, entropy)
 
 
-def ppo_loss_and_grad(params, obs, action, old_value, old_log_prob, gae,
-                      targets, config):
-    """Computes the PPO total loss, aux losses, and d(total)/d(params).
+def ppo_loss_generic(apply_fn, params, obs, action, old_value, old_log_prob,
+                     gae, targets, config):
+    """PPO total loss for an arbitrary policy given as ``apply_fn(params, obs)``.
 
-    Torch-autograd equivalent of ``jax.value_and_grad(_loss_fn, has_aux=True)``.
-    Returns ``((total_loss, (value_loss, loss_actor, entropy)), grads)`` where
-    ``grads`` has the same nested-dict structure as ``params``.
+    Same computation as :func:`ppo_loss` but network-agnostic, so it works for
+    both the MLP ActorCritic and the GNN actor-critic (whose observations are
+    GraphObservation pytrees).
     """
+    clip_eps = float(config["CLIP_EPS"])
+    vf_coef = float(config["VF_COEF"])
+    ent_coef = float(config["ENT_COEF"])
+
+    pi, value = apply_fn(params, obs)
+    log_prob = pi.log_prob(action)
+
+    # CALCULATE VALUE LOSS
+    value_pred_clipped = old_value + _clip_balanced(value - old_value, -clip_eps, clip_eps)
+    value_losses = torch.square(value - targets)
+    value_losses_clipped = torch.square(value_pred_clipped - targets)
+    value_loss = 0.5 * torch.maximum(value_losses, value_losses_clipped).mean()
+
+    # CALCULATE ACTOR LOSS
+    ratio = torch.exp(log_prob - old_log_prob)
+    gae = (gae - gae.mean()) / (gae.std(correction=0) + 1e-8)
+    loss_actor1 = ratio * gae
+    loss_actor2 = _clip_balanced(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * gae
+    loss_actor = -torch.minimum(loss_actor1, loss_actor2)
+    loss_actor = loss_actor.mean()
+    entropy = pi.entropy().mean()
+
+    total_loss = (
+        loss_actor
+        + vf_coef * value_loss
+        - ent_coef * entropy
+    )
+    return total_loss, (value_loss, loss_actor, entropy)
+
+
+def ppo_loss_and_grad_generic(apply_fn, params, obs, action, old_value,
+                              old_log_prob, gae, targets, config):
+    """Network-agnostic ``jax.value_and_grad(_loss_fn, has_aux=True)`` analogue."""
+
     leaves = _tree_leaves(params)
     for leaf in leaves:
         if not leaf.requires_grad:
@@ -262,8 +296,8 @@ def ppo_loss_and_grad(params, obs, action, old_value, old_log_prob, gae,
     action_t = (action if isinstance(action, torch.Tensor)
                 else torch.from_numpy(np.array(action))).to(device)
 
-    total_loss, aux = ppo_loss(
-        params, obs, action_t,
+    total_loss, aux = ppo_loss_generic(
+        apply_fn, params, obs, action_t,
         to_f32(old_value), to_f32(old_log_prob), to_f32(gae), to_f32(targets),
         config)
 
@@ -271,6 +305,20 @@ def ppo_loss_and_grad(params, obs, action, old_value, old_log_prob, gae,
     grads = _tree_unflatten(params, list(grad_leaves))
 
     return (total_loss.detach(), tuple(a.detach() for a in aux)), grads
+
+
+def ppo_loss_and_grad(params, obs, action, old_value, old_log_prob, gae,
+                      targets, config):
+    """Computes the PPO total loss, aux losses, and d(total)/d(params).
+
+    Torch-autograd equivalent of ``jax.value_and_grad(_loss_fn, has_aux=True)``.
+    Returns ``((total_loss, (value_loss, loss_actor, entropy)), grads)`` where
+    ``grads`` has the same nested-dict structure as ``params``.
+    """
+    apply_fn = lambda p, o: apply_actor_critic(p, o, config["ACTIVATION"])
+    return ppo_loss_and_grad_generic(
+        apply_fn, params, obs, action, old_value, old_log_prob, gae, targets,
+        config)
 
 
 # ---------------------------------------------------------------------------
