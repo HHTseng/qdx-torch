@@ -135,7 +135,21 @@ def make_train(config, env, network_params_init = None, env_params = None):
         runner_rng = _rng
         last_obs = obsv
 
+        train_t0 = time.perf_counter()
+        progress_every = max(1, num_epochs // 100)
+
         for _update in range(num_epochs):
+            if _update % progress_every == 0 or _update == num_epochs - 1:
+                elapsed = time.perf_counter() - train_t0
+                rate = (_update + 1) / elapsed if elapsed > 0 else 0.0
+                eta = (num_epochs - _update - 1) / rate if rate > 0 else float("nan")
+                print(
+                    "    update %d/%d (%.1f%%) elapsed=%.1fs eta=%.1fs" % (
+                        _update + 1, num_epochs, 100.0 * (_update + 1) / num_epochs,
+                        elapsed, eta,
+                    ),
+                    flush=True,
+                )
             # COLLECT TRAJECTORIES
             traj_done = torch.zeros((num_steps, num_envs), dtype=torch.bool, device=device)
             traj_action = torch.zeros((num_steps, num_envs), dtype=torch.int32, device=device)

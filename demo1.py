@@ -79,6 +79,7 @@ def plot_metric_curves(x, curves, xlabel: str, ylabel: str, filename: str) -> No
 # Example of [[7,1,3]] code discovery
 # This corresponds to Fig.10 in the paper
 config = {
+    "DEVICE": "cuda",
     "ENV_TYPE": "STANDARD",  # Possibilities: "STANDARD", "MAX", "DELTA", "NOISE-AWARE"
     "N": 7,
     "K": 1,

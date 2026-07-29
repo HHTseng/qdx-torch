@@ -123,7 +123,10 @@ class CodeFinder:
         t0 = time.perf_counter()
         print("==== Training started")
         # Sequential equivalent of jax.vmap over the agents
-        outs_list = [train_fn(rngs[i]) for i in range(self.config['NUM_AGENTS'])]
+        outs_list = []
+        for i in range(self.config['NUM_AGENTS']):
+            print("  -- agent %d/%d" % (i + 1, self.config['NUM_AGENTS']), flush=True)
+            outs_list.append(train_fn(rngs[i]))
         self.config["TIME"] = time.perf_counter() - t0
         print("==== Training finished, time elapsed: %.5f s" % (self.config["TIME"]))
 
