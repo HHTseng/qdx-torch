@@ -3,7 +3,14 @@ import torch
 class TableauSimulator():
 
     """
-    Very simple tableau simulator of Clifford circuits that does not keep track of phases
+    Very simple tableau simulator of Clifford circuits that does not keep track of phases.
+
+    `current_tableau` is the phase-free tableau T_t in Ftwo^{2n x 2n} of
+    RL_QEC_binary_symplectic_notes.tex Sec. 6.2: T_t = M_{U_t}, the symplectic
+    action of the whole accumulated circuit. It starts at T_0 = I_2n and is
+    updated only by right-multiplication, T_{t+1} = T_t M_{A_t} (mod 2)
+    (boxed Eq. (eq:tableau-update)); each gate method below builds one gate
+    matrix M_{A_t} and applies exactly this update.
     """
 
     def __init__(self,
@@ -31,6 +38,7 @@ class TableauSimulator():
         h_operator[:,i+self.n] = temp
 
         # Update the current tableau (only right-multiplication!)
+        # T_{t+1} = T_t M_H (mod 2) -- notes Eq. (eq:tableau-update)
         self.current_tableau =  (self.current_tableau @ h_operator) % 2
 
     def s(self,i):

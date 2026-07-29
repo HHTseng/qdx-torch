@@ -23,6 +23,11 @@ class EnvState:
     time: integer from 0 to max_steps
     cZ: bias parameter
     p_mu: probabilities of all errors considered
+
+    Noise-aware internal MDP state s_t = (T_t, eta, t) of
+    RL_QEC_binary_symplectic_notes.tex Eq. (eq:internal-state), Sec. 8.1,
+    with eta = cZ (Eq. (eq:cZ), Sec. 9). p_mu here plays the role of the
+    per-episode reward weights lambda_mu(cZ) of Eq. (eq:lambda-noise-aware).
     """
     tableau: torch.Tensor
     time: int
@@ -236,6 +241,11 @@ class MetaCodeDiscovery(Environment):
     def get_observation(self, tableau, cZ):
         '''
         Extract the check matrix of stabilizer generators for the observation
+
+        o_t = (vec(G_t), eta) with eta=cZ (rescaled to [0,1]) -- notes Eq.
+        (eq:noise-aware-observation), Sec. 8.1, vs. the fixed-noise o_t=vec(G_t)
+        of Eq. (eq:fixed-observation) used in code_discovery.py. G_t itself
+        is extracted the same way, Eq. (eq:extract-G).
         '''
         ## Only generators without sign
         check_mat = tableau[self.n_qubits_physical + self.n_qubits_logical:].to(torch.float32)
@@ -271,6 +281,13 @@ class MetaCodeDiscovery(Environment):
 
     def check_KL(self, state: EnvState, params: Optional[EnvParams] = EnvParams):
         # Check the Knill-Laflamme conditions for error correction. This is used to reward the agent
+        #
+        # Same K_mu(G) = (1-d_mu(G))(1-m_mu(G)) construction as
+        # code_discovery.CodeDiscovery.check_KL (see that file for the full
+        # derivation from notes Eqs. (eq:detected-indicator)/(eq:membership-
+        # indicator)/(eq:K-binary)/(eq:reward)), except the weights are the
+        # per-episode noise-aware lambda_mu(cZ) = state.p_mu (Eq.
+        # (eq:lambda-noise-aware)) instead of a fixed self.p_mu.
 
         # Extract the stabilizer generators
         check_matrix = state.tableau[self.n_qubits_physical + self.n_qubits_logical:]
@@ -301,7 +318,9 @@ class MetaCodeDiscovery(Environment):
 
         prev_terminal = self.is_terminal(state, params)
 
-        # Update state
+        # Update state: T_{t+1} = T_t M_{A_t} (mod 2); cZ and the reward
+        # weights p_mu are carried over unchanged, matching P_{sas'} =
+        # 1{G'=GM_a} 1{eta'=eta} 1{t'=t+1} (notes Eq. (eq:transition-check)).
         state = EnvState( (state.tableau @ self.actions[action]) % 2, state.time + 1, state.cZ, state.p_mu)
 
         # Update KLs
@@ -343,12 +362,19 @@ class MetaCodeDiscovery(Environment):
             cZ = np.float32(self.cZ)
             pX = np.float32(self.pX)
 
-        # Update p (float32 like the JAX original)
+        # Update p: (p_I, p_X, p_Y, p_Z) = (p_I, p_X, p_X, p_X^cZ) with
+        # cZ = log(p_Z)/log(p_X) (notes boxed Eq. (eq:cZ), Sec. 9): p_Y=p_X
+        # (symmetric X/Y noise) while p_Z is biased by the exponent cZ.
+        # (float32 like the JAX original)
         p = np.array([np.float32(self.pI), pX, pX, pX**cZ], dtype=np.float32)
 
-        # Update p_mu (NumPy float32 arithmetic, then to torch)
+        # Update p_mu: per-error channel probability p_mu(cZ), built qubit-
+        # by-qubit from the X/Y/Z weight of each test error (self.H_X/H_Y/H_Z).
+        # (NumPy float32 arithmetic, then to torch)
         p_mu = p[1] ** np.sum(self.H_X - self.H_Y, axis=1).astype(np.float32) * p[2] ** np.sum(self.H_Y, axis=1).astype(np.float32) * p[3] ** np.sum(self.H_Z - self.H_Y, axis=1).astype(np.float32) * p[0] ** (self.n_qubits_physical - np.sum(self.H_X - self.H_Y + self.H_Z, axis=1)).astype(np.float32)
-        # Normalize p_mu
+        # Normalize p_mu -> lambda_mu(cZ) = p_mu(cZ) / max_nu p_nu(cZ),
+        # notes boxed Eq. (eq:lambda-noise-aware): these are the per-episode
+        # reward weights used by check_KL via state.p_mu.
         p_mu = p_mu / np.max(p_mu)
 
         state = EnvState(

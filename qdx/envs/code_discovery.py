@@ -19,6 +19,11 @@ class EnvState:
 
     tableau: binary array of size 2*n_qubits_physical*(n_qubits_physical-n_qubits_logical)
     time: integer from 0 to max_steps
+
+    Fixed-noise internal MDP state s_t = (T_t, t) of
+    RL_QEC_binary_symplectic_notes.tex Eq. (eq:internal-state), Sec. 8.1
+    (no eta term here since the noise channel is fixed; see
+    meta_code_discovery.EnvState for the noise-aware s_t=(T_t,eta,t)).
     """
     tableau: torch.Tensor
     time: int
@@ -85,7 +90,10 @@ class CodeDiscovery(Environment):
         # Initialize action tensor
         self.actions = self.action_matrix()
 
-        # Symplectic metric Omega
+        # Symplectic metric Omega = [[0,I_n],[I_n,0]] (notes Eq. (eq:omega),
+        # Sec. 3.2). u.Omega.v^T mod 2 is 0 iff the Paulis labelled by rows
+        # u,v commute (Eq. (eq:commutation-test)); this is what makes
+        # syndromes computable as a single matrix product below.
         self.Omega = torch.from_numpy(
             np.kron(np.array([[0,1],[1,0]], dtype=np.uint8), np.eye(n_qubits_physical, dtype=np.uint8)))
 
@@ -173,6 +181,13 @@ class CodeDiscovery(Environment):
     def get_observation(self, tableau):
         '''
         Extract the check matrix for the observation
+
+        G_t = T_t[n+k : 2n, :] (notes boxed Eq. (eq:extract-G), Sec. 6.4):
+        the ancilla-stabilizer rows n_qubits_physical+n_qubits_logical: of
+        the full 2n x 2n tableau are exactly the check matrix of the current
+        candidate stabilizer generators g_{t,1},...,g_{t,r} (Eq.
+        (eq:time-generators)). o_t = vec(G_t) is the observation, Eq.
+        (eq:fixed-observation).
         '''
         ## Only generators without sign
         check_mat = tableau[self.n_qubits_physical + self.n_qubits_logical:].to(torch.uint8)
@@ -214,18 +229,41 @@ class CodeDiscovery(Environment):
 
     def check_KL(self, state: EnvState, params: Optional[EnvParams] = EnvParams):
         # Check the Knill-Laflamme conditions for error correction. This is used to reward the agent
+        #
+        # Implements the binary-matrix-form reward of notes Sec. 8.3
+        # (Eqs. (eq:detected-indicator), (eq:membership-indicator),
+        # (eq:K-binary), (eq:reward)): for each test error E_mu with
+        # binary label e_mu = self.E_mu[mu] and current check matrix
+        # G = check_matrix,
+        #   d_mu(G) = 1{e_mu . Omega . G^T != 0}   (anticommutes, "anticommutes" below)
+        #   m_mu(G) = 1{e_mu in Row(G)}            (is a stabilizer, up to
+        #                                            products of <= softness
+        #                                            generators, self.S_struct)
+        #   K_mu(G) = (1 - d_mu(G)) * (1 - m_mu(G))  -- undetected AND not a
+        #                                                stabilizer = harmful
+        #                                                logical operator
+        # and the returned value is lbda * sum_mu p_mu * K_mu(G), so that
+        # step_env's `reward = -self.check_KL(state)` realizes the boxed
+        # Eq. (eq:reward): r_t = -sum_mu lambda_mu K_mu(S_{t+1}).
 
-        # Extract the stabilizer generators
+        # Extract the stabilizer generators: G = T_t[n+k:] (Eq. (eq:extract-G))
         check_matrix = state.tableau[self.n_qubits_physical + self.n_qubits_logical:]
 
-        # Update the stabilizer group S
+        # Update the stabilizer group S: row-space products of up to
+        # `softness` generators via self.S_struct (approximates Row(G))
         S = self.stabilizer_elements(check_matrix)
 
         # Determine if errors are in S by calculating the logical XOR between S and error operators, E_mu
         # (vectorized equivalent of jax.vmap(jnp.logical_xor, in_axes=(None, 0))(S, E_mu))
+        # -> exact-match test e_mu == (row of S); summing over rows below gives m_mu(G), Eq. (eq:membership-indicator)
         inS = torch.logical_xor(S[None, :, :], self.E_mu[:, None, :])
         inS = torch.logical_not(inS).all(dim=-1).to(torch.int32)
 
+        # self.E_mu @ self.Omega @ check_matrix.T = Sigma = E_M Omega G^T
+        # (notes boxed Eq. (eq:all-syndromes)), the syndrome sigma_G(E_mu)
+        # for every test error against every generator at once; `anticommutes`
+        # is d_mu(G), Eq. (eq:detected-indicator).
+        #
         # Calculate the number of Knill-Laflamme conditions that are not satisfied. This is used for stopping criterion
         anticommutes = torch.any(((self.E_mu @ self.Omega) @ check_matrix.T)%2, dim=1)
         self.num_KL = int(len(self.E_mu) - torch.sum(anticommutes, dim=0) - torch.sum(inS))
@@ -242,10 +280,12 @@ class CodeDiscovery(Environment):
 
         prev_terminal = self.is_terminal(state, params)
 
-        # Update state
+        # Update state: T_{t+1} = T_t M_{A_t} (mod 2), the deterministic
+        # transition kernel P_{sas'} of notes boxed Eq. (eq:transition-tableau)
+        # / (eq:transition-check), Sec. 8.6.
         state = EnvState( (state.tableau @ self.actions[action]) % 2, state.time + 1)
 
-        # Update KLs
+        # Update KLs -- r_t = -check_KL(state), realizing Eq. (eq:reward)
         reward = -self.check_KL(state)
 
         # Evaluate termination conditions
@@ -264,6 +304,8 @@ class CodeDiscovery(Environment):
     ) -> Tuple[torch.Tensor, EnvState]:
         """Performs resetting of environment."""
 
+        # T_0 = I_2n, giving G_0 = [0 | 0  I_r] (initial stabilizers
+        # Z_{k+1},...,Z_n) -- notes Eq. (eq:initial-check) / Sec. 8.7.
         tableau = TableauSimulator(self.n_qubits_physical)
         init_state = tableau.current_tableau[0]
 
