@@ -1,8 +1,9 @@
 """Runs the full JAX-vs-PyTorch comparison suite.
 
-On the gnn-multitask-torch branch, point --jax-repo at the qdx_TCC0731_Jul18
-snapshot (the default): the standard environment and Utils adopt its direct
-error-operator ordering, and the GNN tests compare against its flax model.
+On the size-aware-gnn-v16-torch branch, point --jax-repo at the
+qdx-Size-Aware-GNN-V1-6-New-Reward snapshot (default sibling directory
+``qdx-JAX-V16``): the environment adopts its exact GF(2) verifier, V1.6
+reward, and v1.4 action space.
 
 Usage:
     python tests/run_all.py [--jax-repo /path/to/qdx_jolle_ag]
@@ -24,10 +25,17 @@ TESTS = [
     "test_envs.py",
     "test_network.py",
     "test_gnn_compare.py",
+    "test_v16_compare.py",
     "test_css_env.py",
     "test_end_to_end.py",
     "test_end_to_end_css.py",
     "test_end_to_end_gnn.py",
+]
+
+# Unit-test modules (run with `python -m unittest`), not JAX comparisons.
+UNITTEST_MODULES = [
+    "tests.test_gf2_distance",
+    "tests.test_gnn_qdx",
 ]
 
 
@@ -42,6 +50,13 @@ def main():
              "--jax-repo", args.jax_repo, "--torch-repo", args.torch_repo],
             cwd=here)
         results[test] = proc.returncode == 0
+
+    for module in UNITTEST_MODULES:
+        print(f"\n######## {module} ########", flush=True)
+        proc = subprocess.run(
+            [sys.executable, "-m", "unittest", module],
+            cwd=os.path.dirname(here))
+        results[module] = proc.returncode == 0
 
     print("\n================ SUMMARY ================")
     for test, ok in results.items():

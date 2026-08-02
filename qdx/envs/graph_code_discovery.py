@@ -1,4 +1,4 @@
-"""Graph-observation interface over unchanged QDX environment dynamics (torch)."""
+"""Graph-observation interface for GNN-QDX environment dynamics (torch)."""
 
 from typing import Optional
 
@@ -20,8 +20,8 @@ from qdx.gnn.observation import (
 class GraphCodeDiscovery(CodeDiscovery):
     """CodeDiscovery with padded GraphObservation outputs.
 
-    Reward calculation, terminal logic, action matrices, and tableau transitions are
-    inherited without modification from CodeDiscovery.
+    Reward calculation, terminal logic, and tableau transitions are inherited from
+    CodeDiscovery; graph observations expose the v1.4 dynamic action mask.
     """
 
     def __init__(self, *args, graph_padding: Optional[GraphPadding] = None, **kwargs):
@@ -37,12 +37,17 @@ class GraphCodeDiscovery(CodeDiscovery):
         )
         if len(self.graph_builder.action_descriptors) != self.num_actions:
             raise ValueError("graph action ordering does not match environment actions")
+        self._configure_action_relations(self.graph_builder.max_actions)
 
     def get_obs(
         self, state: EnvState, params: Optional[EnvParams] = None
     ) -> GraphObservation:
         check_matrix = self.get_observation(state.tableau)
-        return self.graph_builder.build(check_matrix, state.time)
+        return self.graph_builder.build(
+            check_matrix,
+            state.time,
+            state.pending_action_mask,
+        )
 
     def step(self, key, state, action, params=None):
         """Gymnax auto-reset with PyTree-aware graph observation selection."""

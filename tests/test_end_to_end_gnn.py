@@ -1,4 +1,4 @@
-"""JAX(TCC) vs PyTorch: end-to-end joint multitask GNN training + validation.
+"""JAX(V1.6) vs PyTorch: end-to-end joint multitask GNN training + validation.
 
 Runs the main.py training path (train_joint_multitask + run_validation) on
 both implementations with identical seeds, three (n,k,d) tasks over two
@@ -19,7 +19,7 @@ from compare_utils import parse_args, repo_on_path, Reporter, tree_max_diff, asn
 
 args = parse_args(__doc__)
 
-r = Reporter("End-to-end joint multitask GNN training (JAX-TCC vs torch)")
+r = Reporter("End-to-end joint multitask GNN training (JAX vs torch)")
 
 CONFIG = {
     "MODEL": "GNN",
@@ -29,6 +29,7 @@ CONFIG = {
     "WHICH_GATES": ("cx", "h"),
     "GRAPH": "All-to-All",
     "SOFTNESS": 1,
+    "KL_METHOD": "gf2_tableau",
     "VALIDATION_SOFTNESS": None,
     "P_I": 0.9,
     "LAMBDA": 10,
@@ -92,13 +93,14 @@ def history_floats(history):
     )
 
 
-def run_side(repo, is_jax):
+def run_side(repo, is_jax, kl_method="gf2_tableau"):
     with repo_on_path(repo):
         import main as main_mod
         from validation import run_validation
         from qdx.utils import build_graph_padding
 
         config = copy.deepcopy(CONFIG)
+        config["KL_METHOD"] = kl_method
         train_padding = build_graph_padding(TRAIN_TASKS)
         validation_padding = build_graph_padding(VALIDATION_TASKS)
         import time
@@ -123,8 +125,9 @@ def run_side(repo, is_jax):
         return params_np, history, layout, validation
 
 
-params_j, history_j, layout_j, validation_j = run_side(args.jax_repo, True)
-params_t, history_t, layout_t, validation_t = run_side(args.torch_repo, False)
+KL_METHOD = "gf2_tableau"
+params_j, history_j, layout_j, validation_j = run_side(args.jax_repo, True, KL_METHOD)
+params_t, history_t, layout_t, validation_t = run_side(args.torch_repo, False, KL_METHOD)
 
 r.check("training layout identical", layout_t == layout_j,
         f"torch {layout_t} vs jax {layout_j}")
@@ -162,5 +165,26 @@ r.check_close(
 )
 r.check("validation: distance summary identical",
         validation_t["distance_summary"] == validation_j["distance_summary"])
+
+# ---------------------------------------------------------------------------
+# The same joint training under the other two V1.6 KL modes: the physical
+# reward kernel differs but progress/success/termination must stay exact.
+for method in ("existing", "gf2"):
+    pj, hj, lj, vj = run_side(args.jax_repo, True, method)
+    pt, ht, lt, vt = run_side(args.torch_repo, False, method)
+    r.check(f"[{method}] episode/success/timeout counts exact",
+            history_ints(ht) == history_ints(hj),
+            f"torch {history_ints(ht)} vs jax {history_ints(hj)}")
+    d = float(np.max(np.abs(history_floats(ht) - history_floats(hj))))
+    r.check(f"[{method}] per-update reward/loss metrics close", d < 1e-4,
+            f"max abs diff {d:.3g}")
+    d = tree_max_diff(pj, pt)
+    r.check(f"[{method}] final params close", d < 1e-4, f"max abs diff {d:.3g}")
+    r.check(f"[{method}] validation gates identical",
+            all(a["gates"] == b["gates"] for a, b in zip(vt["tasks"], vj["tasks"])))
+    r.check(f"[{method}] validation distances identical",
+            all(a["distance"] == b["distance"] for a, b in zip(vt["tasks"], vj["tasks"])),
+            f"torch {[x['distance'] for x in vt['tasks']]} vs "
+            f"jax {[x['distance'] for x in vj['tasks']]}")
 
 r.finish()

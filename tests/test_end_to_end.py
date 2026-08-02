@@ -123,9 +123,16 @@ BASE_DELTA = dict(BASE_STANDARD, ENV_TYPE="DELTA", LAMBDA=10)
 BASE_MAX = dict(BASE_STANDARD, ENV_TYPE="MAX", LAMBDA=10)
 
 # demo1-style config (the repo's actual [[7,1,3]] example, shortened from
-# 2e6 timesteps so the sequential torch side stays fast). 40 epochs = 480
+# 2e6 timesteps so the sequential torch side stays fast). 20 epochs = 240
 # optimizer steps: measured to be safely below the cross-backend float32
-# "chaos onset" for this seed (see LONG-RUN check below).
+# "chaos onset" for this seed on every platform tested (see LONG-RUN below).
+#
+# NOTE (V1.6): the onset is earlier than on the pre-V1.6 branches, because the
+# V1.6 reward adds a progress-delta term whose log-ratio makes trajectories
+# more sensitive to last-bit differences. Measured onset for this seed:
+#   macOS arm64  -> identical (<=5e-7 params) through 20 epochs, diverged by 30
+#   Linux x86-64 -> still identical at 40 epochs
+# 20 epochs is below the onset on both, so the tight check stays meaningful.
 DEMO1_SHORT = {
     "ENV_TYPE": "STANDARD",
     "N": 7, "K": 1, "D": 3,
@@ -139,7 +146,7 @@ DEMO1_SHORT = {
     "LR": 1e-3,
     "NUM_ENVS": 16,
     "NUM_STEPS": 20,
-    "TOTAL_TIMESTEPS": 16 * 20 * 40,   # 40 epochs
+    "TOTAL_TIMESTEPS": 16 * 20 * 20,   # 20 epochs
     "UPDATE_EPOCHS": 3,
     "NUM_MINIBATCHES": 4,
     "GAMMA": 0.99,
@@ -157,7 +164,7 @@ DEMO1_SHORT = {
 
 for label, base in [("STANDARD", BASE_STANDARD), ("NOISE-AWARE", BASE_NOISEAWARE),
                     ("DELTA", BASE_DELTA), ("MAX", BASE_MAX),
-                    ("DEMO1-SHORT (N=7, 40 epochs)", DEMO1_SHORT)]:
+                    ("DEMO1-SHORT (N=7, 20 epochs)", DEMO1_SHORT)]:
     params_j, metrics_j, data_j = run_jax(copy.deepcopy(base))
     params_t, metrics_t, data_t = run_torch(copy.deepcopy(base))
 
@@ -185,7 +192,7 @@ for label, base in [("STANDARD", BASE_STANDARD), ("NOISE-AWARE", BASE_NOISEAWARE
 # ---------------------------------------------------------------------------
 # LONG-RUN check (informational, qualitative criteria).
 #
-# Beyond several hundred optimizer steps the two implementations inevitably
+# Beyond a few hundred optimizer steps the two implementations inevitably
 # diverge: float32 matmuls use different BLAS backends (XLA vs torch/ATen),
 # whose 1-ulp rounding differences are chaotically amplified by the RL
 # feedback loop the first time an argmax/sampling decision lands within
@@ -195,6 +202,7 @@ for label, base in [("STANDARD", BASE_STANDARD), ("NOISE-AWARE", BASE_NOISEAWARE
 # agreement: the same discovered code distances.
 # ---------------------------------------------------------------------------
 LONG_RUN = dict(DEMO1_SHORT, TOTAL_TIMESTEPS=16 * 20 * 60)   # 60 epochs
+# (well past the V1.6 chaos onset on macOS; qualitative agreement only)
 params_j, metrics_j, data_j = run_jax(copy.deepcopy(LONG_RUN))
 params_t, metrics_t, data_t = run_torch(copy.deepcopy(LONG_RUN))
 d = tree_max_diff(params_j, params_t)

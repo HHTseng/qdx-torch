@@ -74,3 +74,30 @@ comparisons target the TCC snapshot.
 | `test_end_to_end_gnn.py` | `main.py`-style joint multitask training (3 tasks × 2 graphs) + full validation on both sides | episode/success counts **exact** (identical trajectories); losses/params ≤ 1e-4; validation gates/distances **exact** |
 | `test_gnn_qdx.py` | torch port of the TCC unit tests (shapes, features, aggregation, action mapping, one PPO update) | run with `python -m unittest tests.test_gnn_qdx` |
 | `bench_gpu_gnn.py` | GNN CPU-vs-GPU correctness + acceleration (single GPU) | run with `CUDA_VISIBLE_DEVICES=0 python tests/bench_gpu_gnn.py` |
+
+## size-aware-gnn-v16-torch branch additions
+
+Baseline is the **`qdx-Size-Aware-GNN-V1-6-New-Reward`** snapshot, extracted
+to a sibling directory `qdx-JAX-V16`:
+
+```bash
+cd qdx-JAX-TCC0731
+git archive qdx-Size-Aware-GNN-V1-6-New-Reward | tar -x -C ../qdx-JAX-V16
+```
+
+| Test | Contents | Criterion |
+|---|---|---|
+| `test_v16_compare.py` | exact GF(2) kernels (all 11 result fields, RREF + direct-tableau, 10 cases incl. randomized Clifford circuits), per-weight stats, host distance verifier, action canonicalization + commutation/cancellation tables, V1.6 reward components over a scripted rollout for all three KL modes, dynamic action mask, symmetric GNN logits, validation verifier | ints/masks/tables **exact**; progress score & delta **exactly 0 diff**; rewards ≤ 3.6e-7; GNN forward ≤ 1e-6 |
+| `test_gf2_distance.py` | port of the V1.6 unit tests (RREF membership, softness disagreement, five-qubit code, anticommuting rejection) | `python -m unittest tests.test_gf2_distance` |
+| `test_gnn_qdx.py` | adds the V1.4 tests (symmetric action canonicalization, pending-mask filtering, order-invariant symmetric logits) | `python -m unittest tests.test_gnn_qdx` |
+| `test_end_to_end_gnn.py` | joint multitask training + validation for **each** KL mode (`existing`, `gf2`, `gf2_tableau`) | episode/success counts **exact**; params ≤ 3.4e-7 |
+| `bench_gpu_v16.py` | CPU-vs-GPU correctness for the exact kernels and GNN, plus kernel/PPO/training acceleration | `CUDA_VISIBLE_DEVICES=0 python tests/bench_gpu_v16.py` |
+
+Full V1.6 results and the measured GPU numbers are recorded in
+`SPEC/TRANSLATION_V1.6_JAX_TO_PYTORCH.md`.
+
+**Chaos-onset note (V1.6).** The V1.6 progress-delta reward makes trajectories
+more sensitive to last-bit float32 differences, so the cross-backend onset is
+earlier than on previous branches. `test_end_to_end.py` therefore uses a
+20-epoch demo1 budget for its tight check (measured bit-tight through 20
+epochs on macOS, through 40 on Linux) and keeps the 60-epoch run qualitative.

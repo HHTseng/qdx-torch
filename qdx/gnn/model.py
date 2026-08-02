@@ -1,4 +1,4 @@
-"""PyTorch implementation of the GNN-QDX v1.3 actor-critic.
+"""PyTorch implementation of the GNN-QDX v1.4 actor-critic.
 
 Functional port of the flax original: parameters live in a flax-style nested
 dict (``params/node_embed_mlp/dense_0/{kernel,bias}`` ...), initialization
@@ -268,11 +268,23 @@ class GNNQDXActorCritic:
             torch.cat([first_h, gate_h, g_actions], dim=-1),
             activation,
         )[..., 0]
-        two_logits = _mlp_apply(
+        # v1.4: score symmetric two-qubit gates in both qubit orders with the
+        # same MLP and average, so CZ/SQRT_XX logits are order invariant.
+        two_forward_logits = _mlp_apply(
             p["two_action_mlp"],
             torch.cat([first_h, second_h, gate_h, g_actions], dim=-1),
             activation,
         )[..., 0]
+        two_reverse_logits = _mlp_apply(
+            p["two_action_mlp"],
+            torch.cat([second_h, first_h, gate_h, g_actions], dim=-1),
+            activation,
+        )[..., 0]
+        two_logits = torch.where(
+            graph_obs.action_is_symmetric,
+            0.5 * (two_forward_logits + two_reverse_logits),
+            two_forward_logits,
+        )
         logits = torch.where(
             graph_obs.action_types == TWO_QUBIT_ACTION, two_logits, single_logits
         )

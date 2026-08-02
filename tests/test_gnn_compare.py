@@ -1,4 +1,4 @@
-"""JAX(TCC) vs PyTorch: GNN graph observations, model init/forward, PPO
+"""JAX(V1.6) vs PyTorch: GNN graph observations, model init/forward, PPO
 loss + autograd gradients, greedy validation rollouts, and one make_train
 PPO update on the graph environment."""
 
@@ -16,7 +16,7 @@ N, K, D = 5, 1, 3
 MAX_STEPS = 8
 GATE_NAMES = ["cx", "h", "s"]
 
-r = Reporter("GNN observation / model / PPO / validation (JAX-TCC vs torch)")
+r = Reporter("GNN observation / model / PPO / validation (JAX vs torch)")
 
 
 def obs_to_np(obs):
@@ -25,8 +25,8 @@ def obs_to_np(obs):
         "node_features", "edge_features", "senders", "receivers",
         "relation_ids", "node_mask", "edge_mask", "qubit_mask",
         "stabilizer_mask", "global_features", "action_types",
-        "action_gate_ids", "action_first", "action_second",
-        "action_edge_indices", "action_mask", "action_env_indices",
+        "action_gate_ids", "action_is_symmetric", "action_first",
+        "action_second", "action_mask", "action_env_indices",
     ]
     return {name: asnp(getattr(obs, name)) for name in fields}
 
@@ -123,7 +123,7 @@ with repo_on_path(args.torch_repo):
         "descriptors": [env_t.action_descriptor(i) for i in range(env_t.num_actions)],
     }
 
-r.check_value_equal("env static: E_mu (TCC direct ordering)", static_t["E_mu"], static_j["E_mu"])
+r.check_value_equal("env static: E_mu (direct ordering)", static_t["E_mu"], static_j["E_mu"])
 r.check_close("env static: p_mu", static_t["p_mu"], static_j["p_mu"], rtol=1e-6, atol=1e-7)
 r.check_value_equal("env static: E_mu_Omega", static_t["E_mu_Omega"], static_j["E_mu_Omega"])
 r.check_value_equal("env static: S_struct", static_t["S_struct"], static_j["S_struct"])
@@ -136,7 +136,7 @@ r.check_close("env rollout: rewards", reward_seq_t, reward_seq_j, rtol=1e-5, ato
 
 int_fields = ["senders", "receivers", "relation_ids", "node_mask", "edge_mask",
               "qubit_mask", "stabilizer_mask", "action_types", "action_gate_ids",
-              "action_first", "action_second", "action_edge_indices",
+              "action_is_symmetric", "action_first", "action_second",
               "action_mask", "action_env_indices"]
 float_fields = ["node_features", "edge_features", "global_features"]
 

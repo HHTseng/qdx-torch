@@ -16,6 +16,11 @@ from qdx.runtime_cache import (
     build_s_structure,
     load_or_build_array_bundle,
 )
+from qdx.gf2_distance import (
+    torch_exact_gf2_kl,
+    torch_tableau_kl,
+    stabilizer_check_matrix_from_gates,
+)
 from qdx.gnn import GraphPadding
 from qdx.make_train import make_actor_critic
 from qdx.simulators import TableauSimulator
@@ -30,6 +35,7 @@ BASE_CONFIG = {
     "WHICH_GATES": ("cx", "h", "s", "sqrt_x", "cz", "sqrt_xx"),
     "GRAPH": "All-to-All",
     "SOFTNESS": 1,
+    "KL_METHOD": "existing",
     "VALIDATION_SOFTNESS": None,
     "P_I": 0.9,
     "LAMBDA": 10,
@@ -251,6 +257,7 @@ def make_env(n, k, d, config, graph_padding, graph_name=None):
         lbda=config["LAMBDA"],
         pI=config["P_I"],
         softness=config["SOFTNESS"],
+        kl_method=config.get("KL_METHOD", "existing"),
         graph_padding=graph_padding,
     )
 
@@ -361,7 +368,7 @@ def format_task(task):
 
 
 def distance_error_stats_up_to_target(
-    n, k, gates, target_distance, softness=None
+    n, k, gates, target_distance, softness=None, kl_method="existing"
 ):
     max_softness = n - k
     if max_softness < 1:
@@ -372,12 +379,52 @@ def distance_error_stats_up_to_target(
         else max(1, min(int(softness), max_softness))
     )
 
-    utilities = Utils(n, k, gates, softness=resolved_softness)
+    method = str(kl_method).strip().lower()
+    method = {"legacy": "existing", "softness": "existing"}.get(method, method)
+    if method not in {"existing", "gf2", "gf2_tableau"}:
+        raise ValueError(
+            "unsupported kl_method %r; choose from existing, gf2, gf2_tableau"
+            % kl_method
+        )
+
+    utilities = None
+    check_matrix = None
+    tableau = None
+    if method == "existing":
+        utilities = Utils(n, k, gates, softness=resolved_softness)
+    elif method == "gf2":
+        check_matrix = torch.from_numpy(
+            np.ascontiguousarray(stabilizer_check_matrix_from_gates(n, k, gates))
+        )
+    else:
+        simulator = TableauSimulator(n)
+        for gate in gates:
+            eval(f"simulator{gate}")
+        tableau = simulator.current_tableau[0].to(torch.uint8)
+
     distance_stats = []
     first_failure = target_distance + 1
     for weight in range(1, target_distance + 1):
-        error_operators = utilities.error_operators(weight)
-        error_count = int(utilities.check_KL(error_operators))
+        if method == "existing":
+            error_operators = utilities.error_operators(weight)
+            error_count = int(utilities.check_KL(error_operators))
+        else:
+            error_operators = torch.from_numpy(
+                np.ascontiguousarray(build_exact_weight_error_operators(n, weight))
+            )
+            probabilities = torch.ones(
+                (error_operators.shape[0],), dtype=torch.float32
+            )
+            if method == "gf2":
+                result = torch_exact_gf2_kl(
+                    check_matrix, error_operators, probabilities, 1.0
+                )
+            else:
+                result = torch_tableau_kl(
+                    tableau, k, error_operators, probabilities, 1.0
+                )
+            error_count = int(result.error_count)
+
         total_count = int(error_operators.shape[0])
         error_rate = error_count / total_count if total_count else 0.0
         distance_stats.append(
